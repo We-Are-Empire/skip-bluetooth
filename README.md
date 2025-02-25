@@ -1,6 +1,7 @@
 # SkipBluetooth
 
-This is a free [Skip](https://skip.tools) Swift/Kotlin library project containing the following modules:
+This is a [Skip](https://skip.tools) Swift/Kotlin library project that
+provides API parity to `CoreBluetooth` for Android.
 
 ## Implementation Instructions
 
@@ -87,12 +88,27 @@ and these to your AndroidManifest.xml
 > [!IMPORTANT]
 > You must request runtime permissions in an `#IF SKIP` block to prevent your app from crashing
 
-Before using any Bluetooth API's, you must request user permissions **in the body of the view or function**
+Before using any Bluetooth API's, you must request user permissions.
+One way to do this is to use the `PermissionManager` API in
+[SkipKit](https://github.com/skiptools/skip-kit#permissionmanager):
+
+```swift
+import SkipKit
+
+func performBluetoothOperation() async {
+    if await PermissionManager.requestPermission("android.permission.BLUETOOTH_SCAN") == true {
+        if await PermissionManager.requestPermission("android.permission.BLUETOOTH_CONNECT") == true {
+            // perform bluetooth operation…
+        }
+    }
+}
+```
+
+An example of manually requesting a permission without using `SkipKit` is as follows.
+In this scenario, note that you must request user permissions **in the body of the view or function**
 which will use Bluetooth.
 
-An example:
-
-```
+```swift
 import SwiftUI
 
 #if SKIP
@@ -135,9 +151,6 @@ public func askForBluetoothPermissions() {
 This will request Bluetooth permissions as soon as the view appears. Subsequent loads of this view will
 not show the prompt again—you will have to request the user to enable Bluetooth in settings if they denied
 permission previously.
-
-There may be a better implementation which automatically shows this prompt when `CBCentralManager` or
-`CBPeripheralManager` are instantiated as is done in `CoreBluetooth`
 
 ## Building
 
