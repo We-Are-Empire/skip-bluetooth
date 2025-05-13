@@ -1,6 +1,6 @@
 # SkipBluetooth
 
-This is a [Skip](https://skip.tools) Swift/Kotlin library project that
+This is a [Skip Lite](https://skip.tools) Swift/Kotlin library project that
 provides API parity to `CoreBluetooth` for Android.
 
 ## Implementation Instructions
