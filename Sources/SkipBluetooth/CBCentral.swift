@@ -18,13 +18,13 @@ extension CBCentral: Equatable {
     }
 }
 
-internal extension CBCentral: KotlinConverting<BluetoothDevice> {
+internal extension CBCentral: KotlinConverting< android.bluetooth.BluetoothDevice> {
     init(platformValue: BluetoothDevice) {
         super.init(macAddress: platformValue.address)
         self.device = platformValue
     }
 
-    override func kotlin(noCopy: Bool) -> BluetoothDevice {
+    override func kotlin(noCopy: Bool) ->  android.bluetooth.BluetoothDevice {
         device
     }
 }

@@ -85,8 +85,8 @@ open class CBCharacteristic : CBAttribute {
     }
 }
 
-public extension CBCharacteristic: KotlinConverting<BluetoothGattCharacteristic> {
-    public override func kotlin(nocopy: Bool) -> BluetoothGattCharacteristic {
+public extension CBCharacteristic: KotlinConverting<android.bluetooth.BluetoothGattCharacteristic> {
+    public override func kotlin(nocopy: Bool) -> android.bluetooth.BluetoothGattCharacteristic {
         return characteristic
     }
 }
