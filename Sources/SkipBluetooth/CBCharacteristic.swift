@@ -85,7 +85,8 @@ open class CBCharacteristic : CBAttribute {
     }
 }
 
-public extension CBCharacteristic: KotlinConverting<android.bluetooth.BluetoothGattCharacteristic> {
+extension CBCharacteristic: KotlinConverting<android.bluetooth.BluetoothGattCharacteristic> {
+    // SKIP @nooverride
     public override func kotlin(nocopy: Bool) -> android.bluetooth.BluetoothGattCharacteristic {
         return characteristic
     }
@@ -109,8 +110,8 @@ open class CBMutableCharacteristic: CBCharacteristic {
 
     // The getter is handled by `CBCharacteristic`, the setter is unimplemented
     @available(*, unavailable)
-    override var properties: CBCharacteristicProperties
-    override var value: Data?
+    open override var properties: CBCharacteristicProperties
+    open override var value: Data?
 
     /* Although `CBCharacteristic` handles setting this value,
        there is no logic here to set the underlying characteristic's descriptor value.

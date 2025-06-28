@@ -15,7 +15,7 @@ public let CBUUIDCharacteristicValidRangeString: String = "2906"
 @available(*, unavailable)
 public let CBUUIDL2CAPPSMCharacteristicString: String = "2A36"
 
-open class CBUUID: NSObject {
+open class CBUUID {
     private lazy var uuid: UUID
 
     @available(*, unavailable)
@@ -43,15 +43,16 @@ open class CBUUID: NSObject {
     }
 }
 
-extension CBUUID: KotlinConverting<java.util.UUID> {
-    public override func kotlin(nocopy: Bool = false) -> java.util.UUID {
-        return uuid.kotlin()
-    }
-}
-
 extension CBUUID: Equatable {
     public static func == (lhs: CBUUID, rhs: CBUUID) -> Bool {
         return lhs.uuidString == rhs.uuidString
+    }
+}
+
+extension CBUUID: KotlinConverting<java.util.UUID> {
+    // SKIP @nooverride
+    public override func kotlin(nocopy: Bool = false) -> java.util.UUID {
+        return uuid.kotlin()
     }
 }
 

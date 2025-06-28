@@ -244,6 +244,7 @@ public protocol CBCentralManagerDelegate {
 
     @available(*, unavailable)
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any])
+    
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber)
 
     func centralManagerDidConnect(central: CBCentralManager, peripheral: CBPeripheral)
@@ -258,15 +259,17 @@ public protocol CBCentralManagerDelegate {
     func centralManagerDidUpdateANCSAuthorizationFor(central: CBCentralManager, peripheral: CBPeripheral)
 }
 
-public extension CBCentralManagerDelegate {
-    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) { return }
-    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {}
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) { return }
-    func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral) { return }
-    func centralManagerDidConnect(central: CBCentralManager, peripheral: CBPeripheral) { return }
-    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: (any Error)?) { return }
-    func centralManagerDidUpdateANCSAuthorizationFor(central: CBCentralManager, peripheral: CBPeripheral) { return }
-    func centralManagerDidDisconnectPeripheral(_ central: CBCentralManager, peripheral: CBPeripheral, error: (any Error)?) { }
+extension CBCentralManagerDelegate {
+    public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) { return }
+    @available(*, unavailable)
+    public func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {}
+    public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?) { return }
+    public func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral) { return }
+    public func centralManagerDidConnect(central: CBCentralManager, peripheral: CBPeripheral) { return }
+    public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: (any Error)?) { return }
+    @available(*, unavailable)
+    public func centralManagerDidUpdateANCSAuthorizationFor(central: CBCentralManager, peripheral: CBPeripheral) { return }
+    public func centralManagerDidDisconnectPeripheral(_ central: CBCentralManager, peripheral: CBPeripheral, error: (any Error)?) { }
 }
 
 #endif

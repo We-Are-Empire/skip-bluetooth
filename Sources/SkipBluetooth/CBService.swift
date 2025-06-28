@@ -67,7 +67,8 @@ open class CBService {
     }
 }
 
-public extension CBService: KotlinConverting<android.bluetooth.BluetoothGattService> {
+extension CBService: KotlinConverting<android.bluetooth.BluetoothGattService> {
+    // SKIP @nooverride
     public override func kotlin(nocopy: Bool) -> android.bluetooth.BluetoothGattService {
         return service
     }

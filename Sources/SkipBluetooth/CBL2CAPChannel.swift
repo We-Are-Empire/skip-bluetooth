@@ -5,7 +5,7 @@
 import Foundation
 public typealias CBL2CAPPSM = UInt16
 
-open class CBL2CAPChannel : NSObject {
+open class CBL2CAPChannel {
     @available(*, unavailable)
     open var peer: CBPeer! { fatalError() }
 

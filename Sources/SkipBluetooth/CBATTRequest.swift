@@ -6,7 +6,7 @@ import Foundation
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothDevice
 
-open class CBATTRequest : NSObject {
+open class CBATTRequest {
     
     open private(set) var central: CBCentral
 
@@ -17,10 +17,10 @@ open class CBATTRequest : NSObject {
     open var value: Data?
 }
 
-internal extension CBATTRequest: Identifiable {
-    var id: Int
+extension CBATTRequest: Identifiable {
+    open var id: Int
 
-    init(device: BluetoothDevice,
+    internal init(device: BluetoothDevice,
          characteristic: BluetoothGattCharacteristic,
          offset: Int,
          value: ByteArray?,

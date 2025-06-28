@@ -9,10 +9,18 @@ open class CBDescriptor: CBAttribute {
 
     @available(*, unavailable)
     open var value: Any? { fatalError() }
+
+    public init(type UUID: CBUUID, value: Any?) {
+        super.init(UUID)
+    }
+
+    public init(type UUID: CBUUID) {
+        super.init(UUID)
+    }
 }
 
 open class CBMutableDescriptor: CBDescriptor {
-    public init(type UUID: CBUUID, value: Any?) {
+    public override init(type UUID: CBUUID, value: Any?) {
         super.init(UUID)
     }
 }
