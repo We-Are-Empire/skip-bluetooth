@@ -4,7 +4,7 @@ import Foundation
 
 #if SKIP
 
-open class CBPeer: NSObject {
+open class CBPeer {
     open var identifier: UUID
 
     required internal init(macAddress: String) {

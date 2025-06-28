@@ -11,7 +11,7 @@ import android.content.BroadcastReceiver
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothAdapter
 
-public class CBManager {
+open class CBManager {
     let context = ProcessInfo.processInfo.androidContext
     private let stateChangedReceiver: StateChangedReceiver
     internal var stateChangedHandler: (() -> Void)?

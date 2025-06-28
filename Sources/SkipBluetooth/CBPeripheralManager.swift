@@ -356,7 +356,7 @@ public class CBPeripheralManager: CBManager {
     }
 }
 
-public protocol CBPeripheralManagerDelegate : NSObjectProtocol {
+public protocol CBPeripheralManagerDelegate {
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager)
 
     @available(*, unavailable)
@@ -381,18 +381,18 @@ public protocol CBPeripheralManagerDelegate : NSObjectProtocol {
     func peripheralManagerDidOpen(_ peripheral: CBPeripheralManager, didOpen channel: CBL2CAPChannel?, error: (any Error)?)
 }
 
-public extension CBPeripheralManagerDelegate {
-    func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String : Any]) {}
-    func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: (any Error)?) {}
-    func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: (any Error)?) {}
-    func peripheralManagerDidSubscribeTo(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {}
-    func peripheralManagerDidUnsubscribeFrom(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {}
-    func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {}
-    func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {}
-    func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {}
-    func peripheralManagerDidPublishL2CAPChannel(_ peripheral: CBPeripheralManager, didPublishL2CAPChannel PSM: CBL2CAPPSM, error: (any Error)?) {}
-    func peripheralManagerDidUnpublishL2CAPChannel(_ peripheral: CBPeripheralManager, didUnpublishL2CAPChannel PSM: CBL2CAPPSM, error: (any Error)?) {}
-    func peripheralManagerDidOpen(_ peripheral: CBPeripheralManager, didOpen channel: CBL2CAPChannel?, error: (any Error)?) {}
+extension CBPeripheralManagerDelegate {
+    public func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String : Any]) {}
+    public func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: (any Error)?) {}
+    public func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: (any Error)?) {}
+    public func peripheralManagerDidSubscribeTo(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {}
+    public func peripheralManagerDidUnsubscribeFrom(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {}
+    public func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {}
+    public func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {}
+    public func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {}
+    public func peripheralManagerDidPublishL2CAPChannel(_ peripheral: CBPeripheralManager, didPublishL2CAPChannel PSM: CBL2CAPPSM, error: (any Error)?) {}
+    public func peripheralManagerDidUnpublishL2CAPChannel(_ peripheral: CBPeripheralManager, didUnpublishL2CAPChannel PSM: CBL2CAPPSM, error: (any Error)?) {}
+    public func peripheralManagerDidOpen(_ peripheral: CBPeripheralManager, didOpen channel: CBL2CAPChannel?, error: (any Error)?) {}
 }
 
 #endif
