@@ -1,7 +1,10 @@
 # Configuration file for https://skip.tools project
+# Modified to enable kotlincompat for proper array bridging to native Swift
 skip:
   mode: 'transpiled'
-  bridging: true
+  bridging:
+    auto: true
+    options: 'kotlincompat'
 
 # Kotlin dependencies and Gradle build options for this module can be configured here
 #build:
