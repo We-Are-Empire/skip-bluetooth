@@ -74,7 +74,18 @@ open class CBCharacteristic : CBAttribute {
 
     @available(*, unavailable)
     open var descriptors: [CBDescriptor]? { fatalError() }
-
+    
+    /// The descriptors discovered for this characteristic.
+    ///
+    /// - Note: On Android, descriptors are automatically available after service discovery.
+    ///   You can access them directly, or call `discoverDescriptors(for:)` for CoreBluetooth
+    ///   API compatibility.
+//    open var descriptors: [CBDescriptor]? {
+//        let androidDescriptors = characteristic.getDescriptors()
+//        guard !androidDescriptors.isEmpty else { return nil }
+//        return androidDescriptors.map { CBDescriptor(platformValue: $0, characteristic: self) }
+//    }
+    
     @available(*, unavailable)
     open var isBroadcasted: Bool { fatalError() }
 

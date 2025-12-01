@@ -15,6 +15,7 @@ import android.content.pm.__
 import android.bluetooth.__
 import android.bluetooth.le.__
 import android.os.ParcelUuid
+import android.os.Build
 
 public enum CBConnectionEvent: Int, @unchecked Sendable {
     case peerDisconnected = 0
@@ -29,8 +30,16 @@ open class CBCentralManager: CBManager {
         tryConnect(to: device)
     }
 
-    // TODO: Allow multiple connections at a time
-    private var pendingGatts: BluetoothGatt?
+    // Support multiple simultaneous connections
+    // Maps device address to its BluetoothGatt connection
+    private var connectedGatts: [String: BluetoothGatt] = [:]
+
+    // Maps device address to its CBPeripheral for callback lookups
+    private var connectedPeripherals: [String: CBPeripheral] = [:]
+
+    // Track device addresses we're currently connected/connecting to
+    // This prevents multiple reconnection attempts after bonding
+    private var connectedDeviceAddresses: Set<String> = []
 
     private var scanner: BluetoothLeScanner? {
         adapter?.getBluetoothLeScanner()
@@ -119,11 +128,41 @@ open class CBCentralManager: CBManager {
     @available(*, unavailable)
     open class func supports(_ features: CBCentralManager.Feature) -> Bool { fatalError() }
 
-    @available(*, unavailable)
-    open func retrievePeripherals(withIdentifiers identifiers: [UUID]) -> [CBPeripheral] { fatalError() }
+    /// Returns peripherals that match the specified identifiers.
+    ///
+    /// - Parameter identifiers: A list of peripheral identifiers (UUIDs based on device MAC address).
+    /// - Returns: A list of peripherals matching the identifiers.
+    ///
+    /// - Note: **Android limitation**: Unlike iOS, this method can only return peripherals that are
+    ///   currently connected by this app. CoreBluetooth on iOS can retrieve previously-seen peripherals
+    ///   that are cached by the system, even if not currently connected. On Android, there is no
+    ///   equivalent system cache for BLE peripherals.
+    open func retrievePeripherals(withIdentifiers identifiers: [UUID]) -> [CBPeripheral] {
+        return identifiers.compactMap { uuid in
+            connectedPeripherals.values.first { $0.identifier == uuid }
+        }
+    }
 
-    @available(*, unavailable)
-    open func retrieveConnectedPeripherals(withServices serviceUUIDs: [CBUUID]) -> [CBPeripheral] { fatalError() }
+    /// Returns peripherals that are currently connected and have discovered the specified services.
+    ///
+    /// - Parameter serviceUUIDs: A list of service UUIDs to filter by.
+    /// - Returns: A list of connected peripherals that have the specified services.
+    ///
+    /// - Note: **Android limitation**: Unlike iOS, this method only returns peripherals connected
+    ///   by this app, not system-wide connections. Additionally, the peripheral must have already
+    ///   called `discoverServices()` for the service filtering to work. CoreBluetooth on iOS can
+    ///   return peripherals connected by any app on the system.
+    open func retrieveConnectedPeripherals(withServices serviceUUIDs: [CBUUID]) -> [CBPeripheral] {
+        guard !serviceUUIDs.isEmpty else {
+            return Array(connectedPeripherals.values)
+        }
+
+        let serviceUUIDStrings = Set(serviceUUIDs.map { $0.uuidString })
+        return connectedPeripherals.values.filter { peripheral in
+            guard let services = peripheral.services else { return false }
+            return services.contains { serviceUUIDStrings.contains($0.uuid.uuidString) }
+        }
+    }
 
     open func connect(_ peripheral: CBPeripheral, options: [String : Any]? = nil) {
         guard hasPermission(android.Manifest.permission.BLUETOOTH_CONNECT) else {
@@ -136,12 +175,30 @@ open class CBCentralManager: CBManager {
         }
 
         logger.log("CBCentralManager.connect: Connecting to \(peripheral.device)")
-        logger.log("CBCentralManager.connect: pendingGatts = \(pendingGatts)")
         tryConnect(to: device)
     }
+    
     open func cancelPeripheralConnection(_ peripheral: CBPeripheral) {
-        peripheral?.gatt.disconnect()
-        peripheral?.gatt.close()
+        guard let address = peripheral.address else {
+            logger.warning("CBCentralManager.cancelPeripheralConnection: Peripheral has no address")
+            return
+        }
+
+        logger.debug("CBCentralManager.cancelPeripheralConnection: Disconnecting \(address)")
+
+        // Use the stored GATT if available, fallback to peripheral's gatt
+        if let gatt = connectedGatts[address] {
+            gatt.disconnect()
+            gatt.close()
+        } else if let gatt = peripheral.gatt {
+            gatt.disconnect()
+            gatt.close()
+        }
+
+        // Clean up tracking state
+        connectedDeviceAddresses.remove(address)
+        connectedPeripherals.removeValue(forKey: address)
+        connectedGatts.removeValue(forKey: address)
     }
 
     @available(*, unavailable)
@@ -192,7 +249,14 @@ open class CBCentralManager: CBManager {
             let action = intent?.action
             switch (action) {
             case BluetoothDevice.ACTION_BOND_STATE_CHANGED:
-                let device = intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.self.java)
+                // Use version-appropriate API for getParcelableExtra
+                let device: BluetoothDevice?
+                if Build.VERSION.SDK_INT >= 33 {
+                    device = intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.self.java)
+                } else {
+                    // Deprecated but required for API < 33
+                    device = intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as? BluetoothDevice
+                }
                 let bondState = intent?.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
                 switch (bondState) {
                 case BluetoothDevice.BOND_BONDED:
@@ -221,8 +285,57 @@ open class CBCentralManager: CBManager {
 // MARK: Private functions
 extension CBCentralManager {
     func tryConnect(to device: BluetoothDevice) {
-        logger.log("CBCentralManager.connect: connecting!")
-        pendingGatts = device.connectGatt(context, false, gattDelegate, BluetoothDevice.TRANSPORT_LE)
+        let deviceAddress = device.address
+
+        // Prevent duplicate connection attempts to the same device
+        // This commonly happens when bonding completes and the broadcast fires multiple times
+        if connectedDeviceAddresses.contains(deviceAddress) {
+            logger.debug("CBCentralManager.tryConnect: Already connected/connecting to \(deviceAddress), skipping")
+            return
+        }
+
+        logger.log("CBCentralManager.connect: connecting to \(deviceAddress)")
+        connectedDeviceAddresses.insert(deviceAddress)
+        let gatt = device.connectGatt(context, false, gattDelegate, BluetoothDevice.TRANSPORT_LE)
+        connectedGatts[deviceAddress] = gatt
+    }
+
+    /// Register a peripheral when connection succeeds (called by BleGattCallback)
+    func registerConnectedPeripheral(_ peripheral: CBPeripheral, for address: String) {
+        connectedPeripherals[address] = peripheral
+    }
+
+    /// Look up a peripheral by device address (called by BleGattCallback)
+    func getPeripheral(for address: String) -> CBPeripheral? {
+        return connectedPeripherals[address]
+    }
+
+    /// Clear connection state for a specific device or all devices
+    /// - Parameter address: The device address to clear, or nil to clear all devices
+    public func clearConnectedDevice(address: String? = nil) {
+        if let address = address {
+            // Clear specific device
+            logger.debug("CBCentralManager.clearConnectedDevice: clearing address \(address)")
+            connectedDeviceAddresses.remove(address)
+            connectedPeripherals.removeValue(forKey: address)
+
+            if let gatt = connectedGatts.removeValue(forKey: address) {
+                logger.debug("CBCentralManager.clearConnectedDevice: closing GATT for \(address)")
+                gatt.disconnect()
+                gatt.close()
+            }
+        } else {
+            // Clear all devices
+            logger.debug("CBCentralManager.clearConnectedDevice: clearing all \(connectedDeviceAddresses.count) devices")
+            for (address, gatt) in connectedGatts {
+                logger.debug("CBCentralManager.clearConnectedDevice: closing GATT for \(address)")
+                gatt.disconnect()
+                gatt.close()
+            }
+            connectedDeviceAddresses.removeAll()
+            connectedPeripherals.removeAll()
+            connectedGatts.removeAll()
+        }
     }
 }
 
