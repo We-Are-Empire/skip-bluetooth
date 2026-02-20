@@ -87,13 +87,6 @@ open class CBCentralManager: CBManager {
         let settingsBuilder = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_FIRST_MATCH)
-        let filterBuilder = ScanFilter.Builder()
-
-        if let serviceUUIDs = serviceUUIDs {
-            for uuid in serviceUUIDs {
-                filterBuilder.setServiceUuid(ParcelUuid(uuid.kotlin()))
-            }
-        }
 
         if let isDuplicate = options?[CBCentralManagerScanOptionAllowDuplicatesKey] as? Bool {
             settingsBuilder.setCallbackType(
@@ -101,16 +94,29 @@ open class CBCentralManager: CBManager {
             )
         }
 
-        // SKIP NOWARN
-        if let uuids = options?[CBCentralManagerScanOptionSolicitedServiceUUIDsKey] as? [CBUUID] {
-            for uuid in uuids {
-                filterBuilder.setServiceSolicitationUuid(ParcelUuid(uuid.kotlin()))
+        let settings = settingsBuilder.build()
+
+        // Build one ScanFilter per service UUID (setServiceUuid replaces, not appends).
+        // An empty filter list scans for all devices (matches iOS behavior with nil serviceUUIDs).
+        var scanFilters: [ScanFilter] = []
+        if let serviceUUIDs = serviceUUIDs {
+            for uuid in serviceUUIDs {
+                let filterBuilder = ScanFilter.Builder()
+                    .setServiceUuid(ParcelUuid(uuid.kotlin()))
+                scanFilters.append(filterBuilder.build())
             }
         }
 
-        let settings = settingsBuilder.build()
-        let scanFilters = listOf(filterBuilder.build())
+        // SKIP NOWARN
+        if let uuids = options?[CBCentralManagerScanOptionSolicitedServiceUUIDsKey] as? [CBUUID] {
+            for uuid in uuids {
+                let filterBuilder = ScanFilter.Builder()
+                    .setServiceSolicitationUuid(ParcelUuid(uuid.kotlin()))
+                scanFilters.append(filterBuilder.build())
+            }
+        }
 
+        // SKIP REPLACE: scanner?.startScan(scanFilters.mutableList, settings, scanDelegate)
         scanner?.startScan(scanFilters, settings, scanDelegate)
         logger.info("CBCentralManager.scanForPeripherals: Starting Scan")
     }
