@@ -26,6 +26,11 @@ open class CBCentralManager: CBManager {
     private let scanDelegate = BleScanCallback(central: self)
     private let gattDelegate = BleGattCallback(central: self)
 
+    /// Tracks discovered device addresses when allowDuplicates is false.
+    private var discoveredAddresses: Set<String> = []
+    /// Whether to suppress duplicate scan results (mirrors iOS allowDuplicates: false).
+    private var suppressDuplicates: Bool = false
+
     private lazy var bondingReceiver: BondCallback! = BondCallback { device in
         tryConnect(to: device)
     }
@@ -84,33 +89,42 @@ open class CBCentralManager: CBManager {
             return
         }
 
+        // Always use ALL_MATCHES — FIRST_MATCH returns empty scan records (no name,
+        // no service UUIDs, rssi=0) on many Android chipsets. Deduplication for
+        // allowDuplicates: false is handled in onScanResult instead, matching iOS behavior.
         let settingsBuilder = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
-            .setCallbackType(ScanSettings.CALLBACK_TYPE_FIRST_MATCH)
-        let filterBuilder = ScanFilter.Builder()
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
 
+        let allowDuplicates = (options?[CBCentralManagerScanOptionAllowDuplicatesKey] as? Bool) ?? false
+        suppressDuplicates = !allowDuplicates
+        discoveredAddresses.removeAll()
+
+        // Android requires one ScanFilter per service UUID — setServiceUuid() overwrites, not appends.
+        var scanFilters: [ScanFilter] = []
         if let serviceUUIDs = serviceUUIDs {
             for uuid in serviceUUIDs {
+                let filterBuilder = ScanFilter.Builder()
                 filterBuilder.setServiceUuid(ParcelUuid(uuid.kotlin()))
+                scanFilters.append(filterBuilder.build())
             }
-        }
-
-        if let isDuplicate = options?[CBCentralManagerScanOptionAllowDuplicatesKey] as? Bool {
-            settingsBuilder.setCallbackType(
-                isDuplicate ? ScanSettings.CALLBACK_TYPE_ALL_MATCHES : ScanSettings.CALLBACK_TYPE_FIRST_MATCH
-            )
+        } else {
+            // No filter — scan for all devices
+            scanFilters.append(ScanFilter.Builder().build())
         }
 
         // SKIP NOWARN
         if let uuids = options?[CBCentralManagerScanOptionSolicitedServiceUUIDsKey] as? [CBUUID] {
             for uuid in uuids {
+                let filterBuilder = ScanFilter.Builder()
                 filterBuilder.setServiceSolicitationUuid(ParcelUuid(uuid.kotlin()))
+                scanFilters.append(filterBuilder.build())
             }
         }
 
         let settings = settingsBuilder.build()
-        let scanFilters = listOf(filterBuilder.build())
 
+        // SKIP REPLACE: scanner?.startScan(scanFilters.toList(), settings, scanDelegate)
         scanner?.startScan(scanFilters, settings, scanDelegate)
         logger.info("CBCentralManager.scanForPeripherals: Starting Scan")
     }
@@ -123,6 +137,7 @@ open class CBCentralManager: CBManager {
 
         logger.info("CentralManager.stopScan: Stopping Scan")
         scanner?.stopScan(scanDelegate)
+        discoveredAddresses.removeAll()
     }
 
     @available(*, unavailable)
@@ -220,7 +235,15 @@ open class CBCentralManager: CBManager {
 
         override func onScanResult(callbackType: Int, result: ScanResult) {
             super.onScanResult(callbackType, result)
-            logger.debug("BleScanCallback.onScanResult: \(result.device.name) - \(result.device.address)")
+            let address = result.device.address
+
+            // Deduplicate when allowDuplicates is false (mirrors iOS CoreBluetooth behavior)
+            if central.suppressDuplicates {
+                if central.discoveredAddresses.contains(address) {
+                    return
+                }
+                central.discoveredAddresses.insert(address)
+            }
 
             delegate?.centralManager(central: central, didDiscover: result.toPeripheral(), advertisementData: result.advertisementData, rssi: NSNumber(value: result.rssi))
         }

@@ -53,7 +53,14 @@ extension ScanResult {
         }
 
         if let uuids = scanRecord?.serviceUuids {
-            advertisementData[CBAdvertisementDataServiceUUIDsKey] = uuids.map { $0.uuid }
+            // Store [CBUUID] to match iOS CoreBluetooth (not [UUID]).
+            // Build explicitly — .map on a Kotlin List returns a Kotlin List,
+            // not skip.lib.Array, which breaks `as? [CBUUID]` casts downstream.
+            var cbuuids: [CBUUID] = []
+            for parcelUuid in uuids {
+                cbuuids.append(CBUUID(string: parcelUuid.uuid.toString()))
+            }
+            advertisementData[CBAdvertisementDataServiceUUIDsKey] = cbuuids
         }
 
         advertisementData[CBAdvertisementDataIsConnectable] = isConnectable
