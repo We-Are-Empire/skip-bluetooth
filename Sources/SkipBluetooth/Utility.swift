@@ -20,7 +20,11 @@ internal func hasPermission(_ permission: String) -> Bool {
     return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
 }
 
-/// Handles behavior for calling `CBCentralManagerDelegate`and `CBPeripheralDelegate` callbacks after a connection has been established
+/// Handles behavior for calling `CBCentralManagerDelegate`and `CBPeripheralDelegate` callbacks after a connection has been established.
+///
+/// All delegate callbacks are dispatched to the main queue to match iOS CoreBluetooth behavior.
+/// Android GATT callbacks fire on a binder thread — direct access to main-actor-isolated state
+/// from a binder thread causes a libdispatch assertion crash.
 internal class BleGattCallback: BluetoothGattCallback {
     private let central: CBCentralManager
 
@@ -52,22 +56,25 @@ internal class BleGattCallback: BluetoothGattCallback {
             if newState == BluetoothProfile.STATE_CONNECTED {
                 logger.debug("GattCallback.onConnectionStateChange: Connected to \(deviceAddress)")
                 let peripheral = getOrCreatePeripheral(for: gatt)
-                centralManagerDelegate?.centralManagerDidConnect(central, peripheral)
+                Task { @MainActor in
+                    self.centralManagerDelegate?.centralManagerDidConnect(self.central, peripheral)
+                }
             } else {
                 logger.debug("GattCallback.onConnectionStateChange: Disconnected from \(deviceAddress)")
-                // Get peripheral before clearing (or create a temporary one for the callback)
                 let peripheral = central.getPeripheral(for: deviceAddress) ?? CBPeripheral(gatt: gatt, gattDelegate: self)
-                // Clear only this specific device's tracking so reconnection is possible
                 central.clearConnectedDevice(address: deviceAddress)
-                centralManagerDelegate?.centralManagerDidDisconnectPeripheral(central, peripheral, nil)
+                Task { @MainActor in
+                    self.centralManagerDelegate?.centralManagerDidDisconnectPeripheral(self.central, peripheral, nil)
+                }
             }
         } else {
             logger.debug("GattCallback.onConnectionStateChange: Failed for \(deviceAddress), status: \(status)")
             let peripheral = central.getPeripheral(for: deviceAddress) ?? CBPeripheral(gatt: gatt, gattDelegate: self)
-            // Clear only this specific device's tracking on connection failure so retry is possible
             central.clearConnectedDevice(address: deviceAddress)
             let error = NSError(domain: "skip.bluetooth", code: 1, userInfo: [NSLocalizedDescriptionKey: "Central manager failed to connect with. Status: \(status)"])
-            centralManagerDelegate?.centralManager(central, didFailToConnect: peripheral, error: error)
+            Task { @MainActor in
+                self.centralManagerDelegate?.centralManager(self.central, didFailToConnect: peripheral, error: error)
+            }
         }
     }
 
@@ -83,11 +90,15 @@ internal class BleGattCallback: BluetoothGattCallback {
             logger.debug("BleGattCallback.onServicesDiscovered: successfully discovered services for \(address)")
             let services = gatt.services.map { $0.toService() }
             self.services = Array(services)
-            peripheral.delegate?.peripheral(peripheral, nil)
+            Task { @MainActor in
+                peripheral.delegate?.peripheral(peripheral, nil)
+            }
         } else {
             logger.debug("BleGattCallback.onServicesDiscovered: failed to discover services for \(address)")
             let error = NSError(domain: "skip.bluetooth", code: state, userInfo: nil)
-            peripheral.delegate?.peripheral(peripheral: peripheral, didDiscoverServices: error)
+            Task { @MainActor in
+                peripheral.delegate?.peripheral(peripheral: peripheral, didDiscoverServices: error)
+            }
         }
     }
 
@@ -114,22 +125,24 @@ internal class BleGattCallback: BluetoothGattCallback {
         let cbCharacteristic = CBCharacteristic(platformValue: characteristic, value: Data(value))
         logger.debug("BluetoothGattCallback.onCharacteristicRead: Characteristic read \(characteristic.uuid) for \(address)")
 
-        if state == APPLE_GENERAL_ERROR {
-            peripheral.delegate?.peripheralDidUpdateValueFor(
-                peripheral,
-                didUpdateValueFor: cbCharacteristic,
-                error: NSError(domain: "skip.bluetooth", code: state, userInfo: nil)
-            )
-        } else {
-            peripheral.delegate?.peripheralDidUpdateValueFor(
-                peripheral,
-                didUpdateValueFor: cbCharacteristic,
-                error: nil
-            )
-        }
+        Task { @MainActor in
+            if state == APPLE_GENERAL_ERROR {
+                peripheral.delegate?.peripheralDidUpdateValueFor(
+                    peripheral,
+                    didUpdateValueFor: cbCharacteristic,
+                    error: NSError(domain: "skip.bluetooth", code: state, userInfo: nil)
+                )
+            } else {
+                peripheral.delegate?.peripheralDidUpdateValueFor(
+                    peripheral,
+                    didUpdateValueFor: cbCharacteristic,
+                    error: nil
+                )
+            }
 
-        // Signal operation complete to process next queued operation
-        peripheral.onOperationComplete()
+            // Signal operation complete to process next queued operation
+            peripheral.onOperationComplete()
+        }
     }
 
     override func onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, state: Int) {
@@ -139,17 +152,20 @@ internal class BleGattCallback: BluetoothGattCallback {
             return
         }
 
-        if state == BluetoothGatt.GATT_SUCCESS {
-            logger.debug("BluetoothGattCallback.onCharacteristicWrite: Successfully wrote to \(address)")
-            peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: CBCharacteristic(platformValue: characteristic), error: nil)
-        } else {
-            let error = NSError(domain: "skip.bluetooth", code: state, userInfo: [NSLocalizedDescriptionKey: "Write to peripheral failed"])
-            logger.error("BluetoothGattCallback.onCharacteristicWrite: Failed to write to \(address) with error: \(error)")
-            peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: CBCharacteristic(platformValue: characteristic), error: error)
-        }
+        let cbChar = CBCharacteristic(platformValue: characteristic)
+        Task { @MainActor in
+            if state == BluetoothGatt.GATT_SUCCESS {
+                logger.debug("BluetoothGattCallback.onCharacteristicWrite: Successfully wrote to \(address)")
+                peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbChar, error: nil)
+            } else {
+                let error = NSError(domain: "skip.bluetooth", code: state, userInfo: [NSLocalizedDescriptionKey: "Write to peripheral failed"])
+                logger.error("BluetoothGattCallback.onCharacteristicWrite: Failed to write to \(address) with error: \(error)")
+                peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbChar, error: error)
+            }
 
-        // Signal operation complete to process next queued operation
-        peripheral.onOperationComplete()
+            // Signal operation complete to process next queued operation
+            peripheral.onOperationComplete()
+        }
     }
 
     // API 33+ version - value passed as parameter
@@ -175,46 +191,50 @@ internal class BleGattCallback: BluetoothGattCallback {
 
         guard state == BluetoothGatt.GATT_SUCCESS else {
             logger.debug("BluetoothGattCallback.onDescriptorRead: Failed to read from \(address)")
-            // For non-CCCD descriptors, call the descriptor delegate
-            if descriptor.uuid != java.util.UUID.fromString(CCCD) {
-                let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic)
-                peripheral.delegate?.peripheralDidUpdateValueFor(
-                    peripheral,
-                    didUpdateValueFor: cbDescriptor,
-                    error: NSError(domain: "skip.bluetooth", code: state, userInfo: nil)
-                )
+            Task { @MainActor in
+                // For non-CCCD descriptors, call the descriptor delegate
+                if descriptor.uuid != java.util.UUID.fromString(CCCD) {
+                    let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic)
+                    peripheral.delegate?.peripheralDidUpdateValueFor(
+                        peripheral,
+                        didUpdateValueFor: cbDescriptor,
+                        error: NSError(domain: "skip.bluetooth", code: state, userInfo: nil)
+                    )
+                }
+                peripheral.onOperationComplete()
             }
-            peripheral.onOperationComplete()
             return
         }
 
-        if descriptor.uuid == java.util.UUID.fromString(CCCD) {
-            // CCCD handling for notifications
-            if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
-                logger.debug("BluetoothGattCallback.onDescriptorRead: Successfully subscribed to characteristic on \(address)")
-                cbCharacteristic.setIsNotifying(to: true)
+        Task { @MainActor in
+            if descriptor.uuid == java.util.UUID.fromString(CCCD) {
+                // CCCD handling for notifications
+                if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                    logger.debug("BluetoothGattCallback.onDescriptorRead: Successfully subscribed to characteristic on \(address)")
+                    cbCharacteristic.setIsNotifying(to: true)
+                } else {
+                    logger.debug("BluetoothGattCallback.onDescriptorRead: Successfully unsubscribed from characteristic on \(address)")
+                    cbCharacteristic.setIsNotifying(to: false)
+                }
+
+                peripheral.delegate?.peripheralDidUpdateNotificationStateFor(
+                    peripheral,
+                    didUpdateNotificationStateFor: cbCharacteristic,
+                    error: nil
+                )
             } else {
-                logger.debug("BluetoothGattCallback.onDescriptorRead: Successfully unsubscribed from characteristic on \(address)")
-                cbCharacteristic.setIsNotifying(to: false)
+                // General descriptor read
+                logger.debug("BluetoothGattCallback.onDescriptorRead: Read descriptor \(descriptor.uuid) on \(address)")
+                let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic, value: Data(value))
+                peripheral.delegate?.peripheralDidUpdateValueFor(
+                    peripheral,
+                    didUpdateValueFor: cbDescriptor,
+                    error: nil
+                )
             }
 
-            peripheral.delegate?.peripheralDidUpdateNotificationStateFor(
-                peripheral,
-                didUpdateNotificationStateFor: cbCharacteristic,
-                error: nil
-            )
-        } else {
-            // General descriptor read
-            logger.debug("BluetoothGattCallback.onDescriptorRead: Read descriptor \(descriptor.uuid) on \(address)")
-            let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic, value: Data(value))
-            peripheral.delegate?.peripheralDidUpdateValueFor(
-                peripheral,
-                didUpdateValueFor: cbDescriptor,
-                error: nil
-            )
+            peripheral.onOperationComplete()
         }
-
-        peripheral.onOperationComplete()
     }
 
     override func onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, state: Int) {
@@ -226,37 +246,38 @@ internal class BleGattCallback: BluetoothGattCallback {
 
         let cbCharacteristic = CBCharacteristic(platformValue: descriptor.characteristic)
 
-        guard state == BluetoothGatt.GATT_SUCCESS else {
-            logger.debug("BluetoothGattCallback.onDescriptorWrite: Failed to write to \(address)")
-            // Call appropriate delegate based on descriptor type
-            if descriptor.uuid == java.util.UUID.fromString(CCCD) {
-                peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbCharacteristic, error: NSError(domain: "skip.bluetooth", code: state, userInfo: nil))
-            } else {
-                let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic)
-                peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbDescriptor, error: NSError(domain: "skip.bluetooth", code: state, userInfo: nil))
+        Task { @MainActor in
+            guard state == BluetoothGatt.GATT_SUCCESS else {
+                logger.debug("BluetoothGattCallback.onDescriptorWrite: Failed to write to \(address)")
+                // Call appropriate delegate based on descriptor type
+                if descriptor.uuid == java.util.UUID.fromString(CCCD) {
+                    peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbCharacteristic, error: NSError(domain: "skip.bluetooth", code: state, userInfo: nil))
+                } else {
+                    let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic)
+                    peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbDescriptor, error: NSError(domain: "skip.bluetooth", code: state, userInfo: nil))
+                }
+                peripheral.onOperationComplete()
+                return
             }
+
+            if descriptor.uuid == java.util.UUID.fromString(CCCD) {
+                logger.debug("BluetoothGattCallback.onDescriptorWrite: Notification enabled successfully on \(address)")
+                cbCharacteristic.setIsNotifying(to: true)
+                peripheral.delegate?.peripheralDidUpdateNotificationStateFor(
+                    peripheral,
+                    didUpdateNotificationStateFor: cbCharacteristic,
+                    error: nil
+                )
+            } else {
+                // General descriptor write
+                logger.debug("BluetoothGattCallback.onDescriptorWrite: Descriptor \(descriptor.uuid) written on \(address)")
+                let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic)
+                peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbDescriptor, error: nil)
+            }
+
+            // Signal operation complete
             peripheral.onOperationComplete()
-            return
         }
-
-        if descriptor.uuid == java.util.UUID.fromString(CCCD) {
-            logger.debug("BluetoothGattCallback.onDescriptorWrite: Notification enabled successfully on \(address)")
-            // Notification is set up - no need to read to confirm, just mark as notifying
-            cbCharacteristic.setIsNotifying(to: true)
-            peripheral.delegate?.peripheralDidUpdateNotificationStateFor(
-                peripheral,
-                didUpdateNotificationStateFor: cbCharacteristic,
-                error: nil
-            )
-        } else {
-            // General descriptor write
-            logger.debug("BluetoothGattCallback.onDescriptorWrite: Descriptor \(descriptor.uuid) written on \(address)")
-            let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic)
-            peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbDescriptor, error: nil)
-        }
-
-        // Signal operation complete
-        peripheral.onOperationComplete()
     }
 
     // API 33+ version - value passed as parameter
@@ -279,12 +300,13 @@ internal class BleGattCallback: BluetoothGattCallback {
         }
 
         let cbCharacteristic = CBCharacteristic(platformValue: characteristic, value: Data(value))
-        logger.debug("BluetoothGattCallback.onCharacteristicChanged: Characteristic changed \(characteristic.uuid) on \(address)")
-        peripheral.delegate?.peripheralDidUpdateValueFor(
-            peripheral,
-            didUpdateValueFor: cbCharacteristic,
-            error: nil
-        )
+        Task { @MainActor in
+            peripheral.delegate?.peripheralDidUpdateValueFor(
+                peripheral,
+                didUpdateValueFor: cbCharacteristic,
+                error: nil
+            )
+        }
     }
 
     override func onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
@@ -294,13 +316,15 @@ internal class BleGattCallback: BluetoothGattCallback {
             return
         }
 
-        if status == BluetoothGatt.GATT_SUCCESS {
-            logger.debug("BluetoothGattCallback.onReadRemoteRssi: RSSI=\(rssi) for \(address)")
-            peripheral.delegate?.peripheral(peripheral, didReadRSSI: NSNumber(value: rssi), error: nil)
-        } else {
-            let error = NSError(domain: "skip.bluetooth", code: status, userInfo: [NSLocalizedDescriptionKey: "Failed to read RSSI"])
-            logger.error("BluetoothGattCallback.onReadRemoteRssi: Failed for \(address) with status \(status)")
-            peripheral.delegate?.peripheral(peripheral, didReadRSSI: NSNumber(value: rssi), error: error)
+        Task { @MainActor in
+            if status == BluetoothGatt.GATT_SUCCESS {
+                logger.debug("BluetoothGattCallback.onReadRemoteRssi: RSSI=\(rssi) for \(address)")
+                peripheral.delegate?.peripheral(peripheral, didReadRSSI: NSNumber(value: rssi), error: nil)
+            } else {
+                let error = NSError(domain: "skip.bluetooth", code: status, userInfo: [NSLocalizedDescriptionKey: "Failed to read RSSI"])
+                logger.error("BluetoothGattCallback.onReadRemoteRssi: Failed for \(address) with status \(status)")
+                peripheral.delegate?.peripheral(peripheral, didReadRSSI: NSNumber(value: rssi), error: error)
+            }
         }
     }
 
