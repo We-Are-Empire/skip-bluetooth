@@ -63,6 +63,7 @@ internal class BleGattCallback: BluetoothGattCallback {
                 logger.debug("GattCallback.onConnectionStateChange: Disconnected from \(deviceAddress)")
                 let peripheral = central.getPeripheral(for: deviceAddress) ?? CBPeripheral(gatt: gatt, gattDelegate: self)
                 central.clearConnectedDevice(address: deviceAddress)
+                gatt.close()
                 Task { @MainActor in
                     self.centralManagerDelegate?.centralManagerDidDisconnectPeripheral(self.central, peripheral, nil)
                 }
@@ -71,6 +72,7 @@ internal class BleGattCallback: BluetoothGattCallback {
             logger.debug("GattCallback.onConnectionStateChange: Failed for \(deviceAddress), status: \(status)")
             let peripheral = central.getPeripheral(for: deviceAddress) ?? CBPeripheral(gatt: gatt, gattDelegate: self)
             central.clearConnectedDevice(address: deviceAddress)
+            gatt.close()
             let error = NSError(domain: "skip.bluetooth", code: 1, userInfo: [NSLocalizedDescriptionKey: "Central manager failed to connect with. Status: \(status)"])
             Task { @MainActor in
                 self.centralManagerDelegate?.centralManager(self.central, didFailToConnect: peripheral, error: error)

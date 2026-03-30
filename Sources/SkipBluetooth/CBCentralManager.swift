@@ -201,19 +201,15 @@ open class CBCentralManager: CBManager {
 
         logger.debug("CBCentralManager.cancelPeripheralConnection: Disconnecting \(address)")
 
-        // Use the stored GATT if available, fallback to peripheral's gatt
+        // Only call disconnect() — do NOT call close() here.
+        // close() deregisters the BluetoothGattCallback, preventing the
+        // onConnectionStateChange(STATE_DISCONNECTED) callback from firing.
+        // close() and tracking cleanup happen in the callback instead.
         if let gatt = connectedGatts[address] {
             gatt.disconnect()
-            gatt.close()
         } else if let gatt = peripheral.gatt {
             gatt.disconnect()
-            gatt.close()
         }
-
-        // Clean up tracking state
-        connectedDeviceAddresses.remove(address)
-        connectedPeripherals.removeValue(forKey: address)
-        connectedGatts.removeValue(forKey: address)
     }
 
     @available(*, unavailable)
