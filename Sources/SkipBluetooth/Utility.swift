@@ -337,11 +337,18 @@ internal class BleGattCallback: BluetoothGattCallback {
             return
         }
 
+        let error: Error?
         if status == BluetoothGatt.GATT_SUCCESS {
             logger.debug("BluetoothGattCallback.onMtuChanged: MTU=\(mtu) for \(address)")
             peripheral.updateMtu(mtu)
+            error = nil
         } else {
             logger.warning("BluetoothGattCallback.onMtuChanged: Failed for \(address) with status \(status)")
+            error = NSError(domain: "skip.bluetooth", code: status, userInfo: [NSLocalizedDescriptionKey: "MTU change failed"])
+        }
+
+        Task { @MainActor in
+            peripheral.delegate?.peripheral(peripheral, didUpdateMtu: mtu, error: error)
         }
     }
 }

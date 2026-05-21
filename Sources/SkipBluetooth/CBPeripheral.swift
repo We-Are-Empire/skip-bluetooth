@@ -20,6 +20,20 @@ public enum CBCharacteristicWriteType : Int, @unchecked Sendable {
     case withoutResponse = 1
 }
 
+/// Connection priority hint for the GATT link (Android only).
+///
+/// Apple's CoreBluetooth auto-tunes the connection interval; Android requires an
+/// explicit `BluetoothGatt.requestConnectionPriority(...)` call. Raw values match
+/// Android's `BluetoothGatt.CONNECTION_PRIORITY_*` constants exactly.
+public enum CBConnectionPriority: Int, @unchecked Sendable {
+    /// Default. ~30–50 ms connection interval. Matches `CONNECTION_PRIORITY_BALANCED`.
+    case balanced = 0
+    /// Faster. ~11.25–15 ms connection interval. Matches `CONNECTION_PRIORITY_HIGH`.
+    case high = 1
+    /// Slower, lower power. ~100–125 ms. Matches `CONNECTION_PRIORITY_LOW_POWER`.
+    case lowPower = 2
+}
+
 extension ScanResult {
     internal var advertisementData: [String: Any] {
         parseAdvertisementData()
@@ -277,6 +291,54 @@ open class CBPeripheral: CBPeer {
         }
     }
 
+    /// Requests a larger ATT MTU on the GATT connection (Android only — `BluetoothGatt.requestMtu`).
+    ///
+    /// Android's default ATT MTU is 23 bytes, capping each notification payload at 20 bytes.
+    /// Negotiating a higher value (the platform max is 517) lets multi-message bursts arrive in
+    /// a single notification rather than fragmented across multiple connection intervals — useful
+    /// for high-throughput peripherals that stream concatenated frames over a single characteristic.
+    ///
+    /// The result is delivered asynchronously via `peripheral(_:didUpdateMtu:error:)`. Apple's
+    /// CoreBluetooth has no equivalent — iOS auto-negotiates MTU at connection time. This API
+    /// is exposed only on Android; iOS callers should not need it.
+    ///
+    /// - Parameter mtu: Desired MTU in bytes (typical range 23–517).
+    /// - Returns: `true` if the request was issued, `false` if `gatt` was nil.
+    @discardableResult
+    open func requestMtu(_ mtu: Int) -> Bool {
+        guard let gatt = gatt else {
+            logger.error("CBPeripheral.requestMtu: gatt is nil")
+            return false
+        }
+        let result = gatt.requestMtu(mtu)
+        if !result {
+            logger.warning("CBPeripheral.requestMtu: Failed to initiate MTU request (\(mtu))")
+        }
+        return result
+    }
+
+    /// Requests a connection priority hint on the GATT link (Android only —
+    /// `BluetoothGatt.requestConnectionPriority`).
+    ///
+    /// Android defaults to `.balanced` (~50 ms interval). `.high` drops it to ~15 ms, dramatically
+    /// improving throughput for streaming peripherals (power meters, HRMs) at the cost of battery.
+    /// Apple's CoreBluetooth auto-tunes the connection interval and provides no equivalent API.
+    ///
+    /// - Parameter priority: Desired connection priority.
+    /// - Returns: `true` if the request was issued, `false` if `gatt` was nil.
+    @discardableResult
+    open func requestConnectionPriority(_ priority: CBConnectionPriority) -> Bool {
+        guard let gatt = gatt else {
+            logger.error("CBPeripheral.requestConnectionPriority: gatt is nil")
+            return false
+        }
+        let result = gatt.requestConnectionPriority(priority.rawValue)
+        if !result {
+            logger.warning("CBPeripheral.requestConnectionPriority: Failed to set priority \(priority.rawValue)")
+        }
+        return result
+    }
+
     open func discoverServices(_ serviceUUIDs: [CBUUID]?) {
         guard hasPermission(android.Manifest.permission.BLUETOOTH) else {
             logger.debug("CBPeripheral.discoverService: Missing permissions")
@@ -467,6 +529,12 @@ public protocol CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: (any Error)?)
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: (any Error)?)
 
+    /// Invoked after `requestMtu(_:)` completes (Android only).
+    ///
+    /// `mtu` reflects the actual negotiated value, which may be smaller than what was requested.
+    /// Not invoked on iOS — CoreBluetooth auto-negotiates MTU at connection time.
+    func peripheral(_ peripheral: CBPeripheral, didUpdateMtu mtu: Int, error: (any Error)?)
+
     @available(*, unavailable)
     func peripheralDidDiscoverIncludedServicesFor(_ peripheral: CBPeripheral, didDiscoverIncludedServicesFor service: CBService, error: (any Error)?)
     func peripheralDidDiscoverCharacteristicsFor(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: (any Error)?)
@@ -491,6 +559,7 @@ extension CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {}
     public func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: (any Error)?) {}
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: (any Error)?) {}
+    public func peripheral(_ peripheral: CBPeripheral, didUpdateMtu mtu: Int, error: (any Error)?) {}
 
     public func peripheralDidWriteValueFor(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: (any Error)?) {}
     public func peripheralDidWriteValueFor(_ peripheral: CBPeripheral, didWriteValueFor descriptor: CBDescriptor, error: (any Error)?) {}
