@@ -6,6 +6,7 @@ import Foundation
 import android.bluetooth.le.__
 import android.bluetooth.__
 import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 
 public enum CBPeripheralState : Int, @unchecked Sendable {
@@ -211,25 +212,41 @@ open class CBPeripheral: CBPeer {
 
         case .writeCharacteristic(let characteristic, let data, let type):
             logger.debug("CBPeripheral: Executing queued write for \(characteristic.uuid.uuidString)")
+            // BLE-audit F3: capture whether the write actually initiated. If it didn't,
+            // no onCharacteristicWrite callback fires, so a .withResponse write would wedge
+            // the operation queue forever — and the CCCD notify-enable write queued behind it
+            // would never run (sensor connects but never streams). Unstick on failure.
+            let writeStarted: Bool
             if Build.VERSION.SDK_INT >= 33 {
-                gatt.writeCharacteristic(characteristic.kotlin(), data.kotlin(), type.rawValue)
+                writeStarted = gatt.writeCharacteristic(characteristic.kotlin(), data.kotlin(), type.rawValue) == BluetoothStatusCodes.SUCCESS
             } else {
                 characteristic.kotlin().setValue(data.kotlin())
                 characteristic.kotlin().setWriteType(type.rawValue)
-                gatt.writeCharacteristic(characteristic.kotlin())
+                writeStarted = gatt.writeCharacteristic(characteristic.kotlin())
             }
-            // For writes without response, process next immediately
-            if type == .withoutResponse {
+            if !writeStarted {
+                logger.error("CBPeripheral: Write operation failed to start")
+                processNextOperation()
+            } else if type == .withoutResponse {
+                // For writes without response, no completion callback — process next immediately
                 processNextOperation()
             }
 
         case .writeDescriptor(let descriptor, let value):
             logger.debug("CBPeripheral: Executing queued descriptor write")
+            // BLE-audit F3: unstick the queue if the descriptor write fails to initiate
+            // (else onDescriptorWrite never fires and the queue wedges — this IS the
+            // CCCD notify-enable path).
+            let descWriteStarted: Bool
             if Build.VERSION.SDK_INT >= 33 {
-                gatt.writeDescriptor(descriptor, value)
+                descWriteStarted = gatt.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
             } else {
                 descriptor.setValue(value)
-                gatt.writeDescriptor(descriptor)
+                descWriteStarted = gatt.writeDescriptor(descriptor)
+            }
+            if !descWriteStarted {
+                logger.error("CBPeripheral: Descriptor write failed to start")
+                processNextOperation()
             }
 
         case .readDescriptor(let androidDescriptor, let cbDescriptor):
@@ -242,11 +259,17 @@ open class CBPeripheral: CBPeer {
 
         case .writeDescriptorValue(let androidDescriptor, let cbDescriptor, let value):
             logger.debug("CBPeripheral: Executing queued descriptor write for \(cbDescriptor.uuid.uuidString)")
+            // BLE-audit F3: unstick the queue if the descriptor write fails to initiate.
+            let descValWriteStarted: Bool
             if Build.VERSION.SDK_INT >= 33 {
-                gatt.writeDescriptor(androidDescriptor, value)
+                descValWriteStarted = gatt.writeDescriptor(androidDescriptor, value) == BluetoothStatusCodes.SUCCESS
             } else {
                 androidDescriptor.setValue(value)
-                gatt.writeDescriptor(androidDescriptor)
+                descValWriteStarted = gatt.writeDescriptor(androidDescriptor)
+            }
+            if !descValWriteStarted {
+                logger.error("CBPeripheral: Descriptor write failed to start")
+                processNextOperation()
             }
         }
     }

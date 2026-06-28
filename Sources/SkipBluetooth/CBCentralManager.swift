@@ -46,6 +46,16 @@ open class CBCentralManager: CBManager {
     // This prevents multiple reconnection attempts after bonding
     private var connectedDeviceAddresses: Set<String> = []
 
+    // BLE-audit F1: the four collections above are read on Android binder threads
+    // (every GATT callback runs `central.getPeripheral(...)` BEFORE its main-actor hop)
+    // and mutated from both binder + main threads. With >1 sensor connected Android
+    // delivers callbacks on independent binder threads → unsynchronized concurrent
+    // access = ConcurrentModificationException / lost-update, and a dropped lookup is a
+    // dropped power/HR/cadence sample. Serialize ALL access through this lock. Discipline:
+    // never hold it across a re-entrant callout (no locked method calls another), and
+    // keep `connectGatt`/`close` outside the critical section.
+    internal let stateLock = NSLock()
+
     private var scanner: BluetoothLeScanner? {
         adapter?.getBluetoothLeScanner()
     }
@@ -97,8 +107,10 @@ open class CBCentralManager: CBManager {
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
 
         let allowDuplicates = (options?[CBCentralManagerScanOptionAllowDuplicatesKey] as? Bool) ?? false
+        stateLock.lock()
         suppressDuplicates = !allowDuplicates
         discoveredAddresses.removeAll()
+        stateLock.unlock()
 
         // Android requires one ScanFilter per service UUID — setServiceUuid() overwrites, not appends.
         var scanFilters: [ScanFilter] = []
@@ -137,7 +149,9 @@ open class CBCentralManager: CBManager {
 
         logger.info("CentralManager.stopScan: Stopping Scan")
         scanner?.stopScan(scanDelegate)
+        stateLock.lock()
         discoveredAddresses.removeAll()
+        stateLock.unlock()
     }
 
     @available(*, unavailable)
@@ -153,6 +167,7 @@ open class CBCentralManager: CBManager {
     ///   that are cached by the system, even if not currently connected. On Android, there is no
     ///   equivalent system cache for BLE peripherals.
     open func retrievePeripherals(withIdentifiers identifiers: [UUID]) -> [CBPeripheral] {
+        stateLock.lock(); defer { stateLock.unlock() }
         return identifiers.compactMap { uuid in
             connectedPeripherals.values.first { $0.identifier == uuid }
         }
@@ -168,6 +183,7 @@ open class CBCentralManager: CBManager {
     ///   called `discoverServices()` for the service filtering to work. CoreBluetooth on iOS can
     ///   return peripherals connected by any app on the system.
     open func retrieveConnectedPeripherals(withServices serviceUUIDs: [CBUUID]) -> [CBPeripheral] {
+        stateLock.lock(); defer { stateLock.unlock() }
         guard !serviceUUIDs.isEmpty else {
             return Array(connectedPeripherals.values)
         }
@@ -205,7 +221,10 @@ open class CBCentralManager: CBManager {
         // close() deregisters the BluetoothGattCallback, preventing the
         // onConnectionStateChange(STATE_DISCONNECTED) callback from firing.
         // close() and tracking cleanup happen in the callback instead.
-        if let gatt = connectedGatts[address] {
+        stateLock.lock()
+        let trackedGatt = connectedGatts[address]
+        stateLock.unlock()
+        if let gatt = trackedGatt {
             gatt.disconnect()
         } else if let gatt = peripheral.gatt {
             gatt.disconnect()
@@ -235,10 +254,11 @@ open class CBCentralManager: CBManager {
 
             // Deduplicate when allowDuplicates is false (mirrors iOS CoreBluetooth behavior)
             if central.suppressDuplicates {
-                if central.discoveredAddresses.contains(address) {
-                    return
-                }
-                central.discoveredAddresses.insert(address)
+                central.stateLock.lock()
+                let alreadySeen = central.discoveredAddresses.contains(address)
+                if !alreadySeen { central.discoveredAddresses.insert(address) }
+                central.stateLock.unlock()
+                if alreadySeen { return }
             }
 
             delegate?.centralManager(central: central, didDiscover: result.toPeripheral(), advertisementData: result.advertisementData, rssi: NSNumber(value: result.rssi))
@@ -307,31 +327,44 @@ extension CBCentralManager {
         let deviceAddress = device.address
 
         // Prevent duplicate connection attempts to the same device
-        // This commonly happens when bonding completes and the broadcast fires multiple times
+        // This commonly happens when bonding completes and the broadcast fires multiple times.
+        // BLE-audit F1: atomic check-and-claim so a double-fired bond broadcast on two
+        // threads can't both pass the guard and connectGatt twice.
+        stateLock.lock()
         if connectedDeviceAddresses.contains(deviceAddress) {
+            stateLock.unlock()
             logger.debug("CBCentralManager.tryConnect: Already connected/connecting to \(deviceAddress), skipping")
             return
         }
+        connectedDeviceAddresses.insert(deviceAddress)
+        stateLock.unlock()
 
         logger.log("CBCentralManager.connect: connecting to \(deviceAddress)")
-        connectedDeviceAddresses.insert(deviceAddress)
         let gatt = device.connectGatt(context, false, gattDelegate, BluetoothDevice.TRANSPORT_LE)
+        stateLock.lock()
         connectedGatts[deviceAddress] = gatt
+        stateLock.unlock()
     }
 
     /// Register a peripheral when connection succeeds (called by BleGattCallback)
     func registerConnectedPeripheral(_ peripheral: CBPeripheral, for address: String) {
+        stateLock.lock(); defer { stateLock.unlock() }
         connectedPeripherals[address] = peripheral
     }
 
-    /// Look up a peripheral by device address (called by BleGattCallback)
+    /// Look up a peripheral by device address (called by BleGattCallback, on a binder thread)
     func getPeripheral(for address: String) -> CBPeripheral? {
+        stateLock.lock(); defer { stateLock.unlock() }
         return connectedPeripherals[address]
     }
 
     /// Clear connection state for a specific device or all devices
     /// - Parameter address: The device address to clear, or nil to clear all devices
     public func clearConnectedDevice(address: String? = nil) {
+        // BLE-audit F1: atomic multi-collection clear under the lock. The gatt
+        // disconnect()/close() calls below don't re-enter (Android fires their callbacks
+        // asynchronously on a binder thread), so holding the lock across them is safe.
+        stateLock.lock(); defer { stateLock.unlock() }
         if let address = address {
             // Clear specific device
             logger.debug("CBCentralManager.clearConnectedDevice: clearing address \(address)")
