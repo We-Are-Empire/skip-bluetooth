@@ -20,9 +20,63 @@ internal func hasPermission(_ permission: String) -> Bool {
     return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
 }
 
+// MARK: Serial delegate-callback delivery (CoreBluetooth parity)
+
+/// A delegate callout queued for serial main-actor delivery.
+/// (A concrete class element rather than `AsyncStream<() -> Void>` — concrete element types
+/// are the transpile-proven `AsyncStream` shape.)
+internal final class BleCallout {
+    let body: () -> Void
+    init(_ body: @escaping () -> Void) {
+        self.body = body
+    }
+}
+
+/// A single serial FIFO pipeline that delivers ALL BLE delegate callbacks on the main actor.
+///
+/// iOS CoreBluetooth delivers every `CBCentralManagerDelegate`/`CBPeripheralDelegate` callback on
+/// ONE serial queue, so callbacks can never overtake each other. Spawning an independent
+/// unstructured `Task { @MainActor }` per Android GATT/scan callback (the previous approach here)
+/// gives NO ordering guarantee between tasks — back-to-back notifications could be delivered
+/// reordered or bursty, which measurably corrupted recorded power averages. Funneling every
+/// delegate callout through this one unbounded channel restores CoreBluetooth-parity serial FIFO
+/// delivery:
+/// - Producers are Android binder threads. Callbacks for a single `BluetoothGatt` are serialized
+///   by Android, but different devices deliver on independent binder threads, so `dispatch(_:)`
+///   takes a dedicated lock around the enqueue to make the cross-thread enqueue order total and
+///   well-defined. `yield` itself is a synchronous, non-blocking, order-preserving channel send.
+///   (A dedicated lock, not `CBCentralManager.stateLock`: the pipeline is process-global and
+///   must not couple to any one manager's lock discipline.)
+/// - One long-lived consumer task executes the callouts on the main actor, strictly in enqueue
+///   order, for the lifetime of the process.
+internal final class BleCallbackPipeline {
+    static let shared = BleCallbackPipeline()
+
+    private let lock = NSLock()
+    private let enqueue: (BleCallout) -> Void
+
+    private init() {
+        let (stream, continuation) = AsyncStream.makeStream(of: BleCallout.self)
+        self.enqueue = { callout in continuation.yield(callout) }
+        Task { @MainActor in
+            for await callout in stream {
+                callout.body()
+            }
+        }
+    }
+
+    /// Enqueues a delegate callout for in-order delivery on the main actor.
+    func dispatch(_ block: @escaping () -> Void) {
+        lock.lock()
+        enqueue(BleCallout(block))
+        lock.unlock()
+    }
+}
+
 /// Handles behavior for calling `CBCentralManagerDelegate`and `CBPeripheralDelegate` callbacks after a connection has been established.
 ///
-/// All delegate callbacks are dispatched to the main queue to match iOS CoreBluetooth behavior.
+/// All delegate callbacks are funneled through `BleCallbackPipeline` for serial, in-order
+/// delivery on the main actor, matching iOS CoreBluetooth's single serial delegate queue.
 /// Android GATT callbacks fire on a binder thread — direct access to main-actor-isolated state
 /// from a binder thread causes a libdispatch assertion crash.
 internal class BleGattCallback: BluetoothGattCallback {
@@ -56,7 +110,7 @@ internal class BleGattCallback: BluetoothGattCallback {
             if newState == BluetoothProfile.STATE_CONNECTED {
                 logger.debug("GattCallback.onConnectionStateChange: Connected to \(deviceAddress)")
                 let peripheral = getOrCreatePeripheral(for: gatt)
-                Task { @MainActor in
+                BleCallbackPipeline.shared.dispatch {
                     self.centralManagerDelegate?.centralManagerDidConnect(self.central, peripheral)
                 }
             } else {
@@ -64,7 +118,7 @@ internal class BleGattCallback: BluetoothGattCallback {
                 let peripheral = central.getPeripheral(for: deviceAddress) ?? CBPeripheral(gatt: gatt, gattDelegate: self)
                 central.clearConnectedDevice(address: deviceAddress)
                 gatt.close()
-                Task { @MainActor in
+                BleCallbackPipeline.shared.dispatch {
                     self.centralManagerDelegate?.centralManagerDidDisconnectPeripheral(self.central, peripheral, nil)
                 }
             }
@@ -74,7 +128,7 @@ internal class BleGattCallback: BluetoothGattCallback {
             central.clearConnectedDevice(address: deviceAddress)
             gatt.close()
             let error = NSError(domain: "skip.bluetooth", code: 1, userInfo: [NSLocalizedDescriptionKey: "Central manager failed to connect with. Status: \(status)"])
-            Task { @MainActor in
+            BleCallbackPipeline.shared.dispatch {
                 self.centralManagerDelegate?.centralManager(self.central, didFailToConnect: peripheral, error: error)
             }
         }
@@ -92,13 +146,13 @@ internal class BleGattCallback: BluetoothGattCallback {
             logger.debug("BleGattCallback.onServicesDiscovered: successfully discovered services for \(address)")
             let services = gatt.services.map { $0.toService() }
             self.services = Array(services)
-            Task { @MainActor in
+            BleCallbackPipeline.shared.dispatch {
                 peripheral.delegate?.peripheral(peripheral, nil)
             }
         } else {
             logger.debug("BleGattCallback.onServicesDiscovered: failed to discover services for \(address)")
             let error = NSError(domain: "skip.bluetooth", code: state, userInfo: nil)
-            Task { @MainActor in
+            BleCallbackPipeline.shared.dispatch {
                 peripheral.delegate?.peripheral(peripheral: peripheral, didDiscoverServices: error)
             }
         }
@@ -127,7 +181,7 @@ internal class BleGattCallback: BluetoothGattCallback {
         let cbCharacteristic = CBCharacteristic(platformValue: characteristic, value: Data(value))
         logger.debug("BluetoothGattCallback.onCharacteristicRead: Characteristic read \(characteristic.uuid) for \(address)")
 
-        Task { @MainActor in
+        BleCallbackPipeline.shared.dispatch {
             if state == APPLE_GENERAL_ERROR {
                 peripheral.delegate?.peripheralDidUpdateValueFor(
                     peripheral,
@@ -155,7 +209,7 @@ internal class BleGattCallback: BluetoothGattCallback {
         }
 
         let cbChar = CBCharacteristic(platformValue: characteristic)
-        Task { @MainActor in
+        BleCallbackPipeline.shared.dispatch {
             if state == BluetoothGatt.GATT_SUCCESS {
                 logger.debug("BluetoothGattCallback.onCharacteristicWrite: Successfully wrote to \(address)")
                 peripheral.delegate?.peripheralDidWriteValueFor(peripheral, didWriteValueFor: cbChar, error: nil)
@@ -193,7 +247,7 @@ internal class BleGattCallback: BluetoothGattCallback {
 
         guard state == BluetoothGatt.GATT_SUCCESS else {
             logger.debug("BluetoothGattCallback.onDescriptorRead: Failed to read from \(address)")
-            Task { @MainActor in
+            BleCallbackPipeline.shared.dispatch {
                 // For non-CCCD descriptors, call the descriptor delegate
                 if descriptor.uuid != java.util.UUID.fromString(CCCD) {
                     let cbDescriptor = CBDescriptor(platformValue: descriptor, characteristic: cbCharacteristic)
@@ -208,7 +262,7 @@ internal class BleGattCallback: BluetoothGattCallback {
             return
         }
 
-        Task { @MainActor in
+        BleCallbackPipeline.shared.dispatch {
             if descriptor.uuid == java.util.UUID.fromString(CCCD) {
                 // CCCD handling for notifications
                 if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
@@ -248,7 +302,7 @@ internal class BleGattCallback: BluetoothGattCallback {
 
         let cbCharacteristic = CBCharacteristic(platformValue: descriptor.characteristic)
 
-        Task { @MainActor in
+        BleCallbackPipeline.shared.dispatch {
             guard state == BluetoothGatt.GATT_SUCCESS else {
                 logger.debug("BluetoothGattCallback.onDescriptorWrite: Failed to write to \(address)")
                 // Call appropriate delegate based on descriptor type
@@ -302,7 +356,7 @@ internal class BleGattCallback: BluetoothGattCallback {
         }
 
         let cbCharacteristic = CBCharacteristic(platformValue: characteristic, value: Data(value))
-        Task { @MainActor in
+        BleCallbackPipeline.shared.dispatch {
             peripheral.delegate?.peripheralDidUpdateValueFor(
                 peripheral,
                 didUpdateValueFor: cbCharacteristic,
@@ -318,7 +372,7 @@ internal class BleGattCallback: BluetoothGattCallback {
             return
         }
 
-        Task { @MainActor in
+        BleCallbackPipeline.shared.dispatch {
             if status == BluetoothGatt.GATT_SUCCESS {
                 logger.debug("BluetoothGattCallback.onReadRemoteRssi: RSSI=\(rssi) for \(address)")
                 peripheral.delegate?.peripheral(peripheral, didReadRSSI: NSNumber(value: rssi), error: nil)
@@ -347,7 +401,7 @@ internal class BleGattCallback: BluetoothGattCallback {
             error = NSError(domain: "skip.bluetooth", code: status, userInfo: [NSLocalizedDescriptionKey: "MTU change failed"])
         }
 
-        Task { @MainActor in
+        BleCallbackPipeline.shared.dispatch {
             peripheral.delegate?.peripheral(peripheral, didUpdateMtu: mtu, error: error)
         }
     }

@@ -261,7 +261,17 @@ open class CBCentralManager: CBManager {
                 if alreadySeen { return }
             }
 
-            delegate?.centralManager(central: central, didDiscover: result.toPeripheral(), advertisementData: result.advertisementData, rssi: NSNumber(value: result.rssi))
+            // Deliver through the shared FIFO pipeline, not synchronously: CoreBluetooth delivers
+            // scan results on the same serial queue as every other delegate callback, so a
+            // didDiscover must stay ordered relative to connection/value callouts.
+            let scanDelegate = self.delegate
+            let scanCentral = self.central
+            let discovered = result.toPeripheral()
+            let advertisementData = result.advertisementData
+            let rssi = NSNumber(value: result.rssi)
+            BleCallbackPipeline.shared.dispatch {
+                scanDelegate?.centralManager(central: scanCentral, didDiscover: discovered, advertisementData: advertisementData, rssi: rssi)
+            }
         }
 
         @available(*, unavailable)
