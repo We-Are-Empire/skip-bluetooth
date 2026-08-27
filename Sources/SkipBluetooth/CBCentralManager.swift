@@ -93,6 +93,14 @@ open class CBCentralManager: CBManager {
         let filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
         let context = ProcessInfo.processInfo.androidContext
         context.registerReceiver(bondingReceiver, filter)
+
+        // Android leaves a GATT client open when the app process ends; iOS does
+        // not. See `ProcessTerminationCleanup`.
+        ProcessTerminationCleanup.shared.register(self)
+    }
+
+    deinit {
+        ProcessTerminationCleanup.shared.unregister(self)
     }
 
     @available(*, unavailable)
