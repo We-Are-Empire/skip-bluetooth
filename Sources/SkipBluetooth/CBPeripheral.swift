@@ -120,6 +120,16 @@ open class CBPeripheral: CBPeer {
     private var operationQueue: [GattOperation] = []
     /// Whether an operation is currently in progress
     private var isOperationInProgress: Bool = false
+    /// The operation currently awaiting its GATT callback, so a callback that
+    /// cannot be answered yet can re-queue exactly the work that produced it.
+    private var currentOperation: GattOperation?
+    /// Operations the peer answered with a pre-bond authentication prompt.
+    ///
+    /// CoreBluetooth delivers nothing to the delegate while pairing is in
+    /// flight and exactly one callback once it settles. These are that pending
+    /// callback: replayed on `BOND_BONDED`, failed with `CBATTError`
+    /// `insufficientAuthentication` if bonding ends in `BOND_NONE`.
+    private var operationsAwaitingBond: [GattOperation] = []
     /// Lock for thread-safe queue access
     private let queueLock = NSLock()
 
@@ -187,6 +197,7 @@ open class CBPeripheral: CBPeer {
 
         isOperationInProgress = true
         let operation = operationQueue.removeFirst()
+        currentOperation = operation
         queueLock.unlock()
 
         executeOperation(operation)
@@ -277,7 +288,75 @@ open class CBPeripheral: CBPeer {
     /// Called by BleGattCallback when an operation completes
     internal func onOperationComplete() {
         logger.debug("CBPeripheral: Operation complete, processing next")
+        queueLock.lock()
+        currentOperation = nil
+        queueLock.unlock()
         processNextOperation()
+    }
+
+    // MARK: - Pre-bond deferral
+
+    /// Hold the in-flight operation until the bond resolves.
+    ///
+    /// Called when the peer answered with `GATT_INSUFFICIENT_AUTHENTICATION` or
+    /// `GATT_INSUFFICIENT_ENCRYPTION` on a device that is not bonded yet — the
+    /// peer asking to pair, not a failure. No delegate callback is delivered,
+    /// matching CoreBluetooth, which stays silent for the duration of pairing.
+    internal func deferCurrentOperationUntilBonded() {
+        queueLock.lock()
+        if let operation = currentOperation {
+            operationsAwaitingBond.append(operation)
+        }
+        currentOperation = nil
+        queueLock.unlock()
+    }
+
+    /// Bonding succeeded: replay the held operations so each delivers the one
+    /// callback CoreBluetooth would have delivered after pairing.
+    internal func resumeOperationsAwaitingBond() {
+        queueLock.lock()
+        let held = operationsAwaitingBond
+        operationsAwaitingBond = []
+        // Ahead of anything queued since: these were issued first.
+        operationQueue = held + operationQueue
+        let shouldProcess = !isOperationInProgress && !operationQueue.isEmpty
+        queueLock.unlock()
+
+        if !held.isEmpty {
+            logger.debug("CBPeripheral: Bonded — replaying \(held.count) held operation(s)")
+        }
+        if shouldProcess {
+            processNextOperation()
+        }
+    }
+
+    /// Bonding ended without a bond (user cancelled, timed out, or the peer
+    /// refused): fail the held operations the way CoreBluetooth does, with
+    /// `CBATTError.insufficientAuthentication`.
+    internal func failOperationsAwaitingBond() {
+        queueLock.lock()
+        let held = operationsAwaitingBond
+        operationsAwaitingBond = []
+        queueLock.unlock()
+
+        guard !held.isEmpty else { return }
+        logger.debug("CBPeripheral: Bonding did not complete — failing \(held.count) held operation(s)")
+        for operation in held {
+            let error = attParityError(status: 5, message: "Pairing was not completed")
+            switch operation {
+            case .readCharacteristic(let characteristic):
+                delegate?.peripheralDidUpdateValueFor(self, didUpdateValueFor: characteristic, error: error)
+            case .writeCharacteristic(let characteristic, _, _):
+                delegate?.peripheralDidWriteValueFor(self, didWriteValueFor: characteristic, error: error)
+            case .writeDescriptor(let descriptor, _):
+                let cbCharacteristic = CBCharacteristic(platformValue: descriptor.characteristic)
+                delegate?.peripheralDidWriteValueFor(self, didWriteValueFor: cbCharacteristic, error: error)
+            case .readDescriptor(_, let cbDescriptor):
+                delegate?.peripheralDidUpdateValueFor(self, didUpdateValueFor: cbDescriptor, error: error)
+            case .writeDescriptorValue(_, let cbDescriptor, _):
+                delegate?.peripheralDidWriteValueFor(self, didWriteValueFor: cbDescriptor, error: error)
+            }
+        }
     }
 
     /// Indicates whether the peripheral is ready to send a write without response.

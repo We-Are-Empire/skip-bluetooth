@@ -31,9 +31,13 @@ open class CBCentralManager: CBManager {
     /// Whether to suppress duplicate scan results (mirrors iOS allowDuplicates: false).
     private var suppressDuplicates: Bool = false
 
-    private lazy var bondingReceiver: BondCallback! = BondCallback { device in
-        tryConnect(to: device)
-    }
+    private lazy var bondingReceiver: BondCallback! = BondCallback(
+        completion: { device in
+            self.onDeviceBonded(device)
+        },
+        bondFailed: { device, wasBonding in
+            self.onDeviceBondFailed(device, wasBonding: wasBonding)
+        })
 
     // Support multiple simultaneous connections
     // Maps device address to its BluetoothGatt connection
@@ -78,9 +82,13 @@ open class CBCentralManager: CBManager {
             delegate?.centralManagerDidUpdateState(self)
         }
 
-        bondingReceiver = BondCallback { device in
-            tryConnect(to: device)
-        }
+        bondingReceiver = BondCallback(
+            completion: { device in
+                self.onDeviceBonded(device)
+            },
+            bondFailed: { device, wasBonding in
+                self.onDeviceBondFailed(device, wasBonding: wasBonding)
+            })
 
         let filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
         let context = ProcessInfo.processInfo.androidContext
@@ -290,8 +298,14 @@ open class CBCentralManager: CBManager {
 
     private class BondCallback: BroadcastReceiver {
         private let completion: (BluetoothDevice) -> Void
-        init(completion: @escaping (BluetoothDevice) -> Void) {
+        /// Bonding ended without a bond. `wasBonding` distinguishes a pairing
+        /// that just failed (cancelled PIN, timeout, refusal) from an unbond of
+        /// a device that was already paired.
+        private let bondFailed: (BluetoothDevice, Bool) -> Void
+        init(completion: @escaping (BluetoothDevice) -> Void,
+             bondFailed: @escaping (BluetoothDevice, Bool) -> Void) {
             self.completion = completion
+            self.bondFailed = bondFailed
         }
 
         override func onReceive(context: Context?, intent: Intent?) {
@@ -322,6 +336,13 @@ open class CBCentralManager: CBManager {
                     break
                 case BluetoothDevice.BOND_NONE:
                     logger.debug("StateChangedReceiver: Bonding failed or broken")
+                    guard let device = device else {
+                        logger.error("BondCallback.onReceive: Device is nil")
+                        return
+                    }
+                    let previous = intent?.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
+                                                       BluetoothDevice.ERROR)
+                    bondFailed(device, previous == BluetoothDevice.BOND_BONDING)
                     break
                 default:
                     break
@@ -363,6 +384,23 @@ extension CBCentralManager {
     }
 
     /// Look up a peripheral by device address (called by BleGattCallback, on a binder thread)
+    /// Bonding succeeded: connect if this bond was what we were waiting on, and
+    /// replay any ATT operations the peer had answered with the pairing prompt.
+    func onDeviceBonded(_ device: BluetoothDevice) {
+        getPeripheral(for: device.address)?.resumeOperationsAwaitingBond()
+        tryConnect(to: device)
+    }
+
+    /// Bonding ended without a bond. When it followed `BOND_BONDING` the
+    /// pairing itself failed (cancelled PIN, timeout, refusal), which is what
+    /// CoreBluetooth reports as `CBATTError.insufficientAuthentication` on the
+    /// operation that triggered it — so fail the held operations rather than
+    /// leaving the caller waiting for a callback that can never arrive.
+    func onDeviceBondFailed(_ device: BluetoothDevice, wasBonding: Bool) {
+        guard wasBonding else { return }
+        getPeripheral(for: device.address)?.failOperationsAwaitingBond()
+    }
+
     func getPeripheral(for address: String) -> CBPeripheral? {
         stateLock.lock(); defer { stateLock.unlock() }
         return connectedPeripherals[address]
