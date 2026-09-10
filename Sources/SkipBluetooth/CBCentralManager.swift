@@ -231,15 +231,37 @@ open class CBCentralManager: CBManager {
             return
         }
 
+        // A connect that never reached STATE_CONNECTED is cancelled, not
+        // disconnected, and Android reports no state change for a cancelled
+        // connect: the onConnectionStateChange that closes the client and
+        // clears this tracking can never run. Release it here instead, or the
+        // GATT client stays registered for the life of the process and the
+        // address stays in `connectedDeviceAddresses`, where `tryConnect`
+        // reads it as "already connecting" and silently skips every later
+        // connect to that camera. Held under one lock so a CONNECTED callback
+        // racing in (it takes the same lock in `registerConnectedPeripheral`)
+        // either lands first and gets the disconnect path below, or lands
+        // after the close that deregisters it.
+        stateLock.lock()
+        let trackedGatt = connectedGatts[address]
+        let isEstablished = connectedPeripherals[address] != nil
+        if !isEstablished, let pendingGatt = trackedGatt {
+            logger.debug("CBCentralManager.cancelPeripheralConnection: Cancelling pending connect to \(address)")
+            connectedGatts.removeValue(forKey: address)
+            connectedDeviceAddresses.remove(address)
+            pendingGatt.disconnect()
+            pendingGatt.close()
+            stateLock.unlock()
+            return
+        }
+        stateLock.unlock()
+
         logger.debug("CBCentralManager.cancelPeripheralConnection: Disconnecting \(address)")
 
-        // Only call disconnect() — do NOT call close() here.
+        // Established link: only call disconnect() — do NOT call close() here.
         // close() deregisters the BluetoothGattCallback, preventing the
         // onConnectionStateChange(STATE_DISCONNECTED) callback from firing.
         // close() and tracking cleanup happen in the callback instead.
-        stateLock.lock()
-        let trackedGatt = connectedGatts[address]
-        stateLock.unlock()
         if let gatt = trackedGatt {
             gatt.disconnect()
         } else if let gatt = peripheral.gatt {
@@ -412,6 +434,31 @@ extension CBCentralManager {
     func getPeripheral(for address: String) -> CBPeripheral? {
         stateLock.lock(); defer { stateLock.unlock() }
         return connectedPeripherals[address]
+    }
+
+    /// Clear connection state for the connected device whose peripheral
+    /// identifier matches, leaving every other connection alone. A caller
+    /// holding an identifier rather than a MAC address (the wrapper's public
+    /// surface is identifier-keyed) needs this to name one device: clearing
+    /// "all" to reach one closes every other camera's GATT client behind its
+    /// owner's back, and closing deregisters the callback, so nobody is ever
+    /// told the link went away.
+    /// - Returns: true when a matching connection was found and cleared.
+    @discardableResult
+    public func clearConnectedDevice(peripheralIdentifier: String) -> Bool {
+        stateLock.lock()
+        var match: String? = nil
+        for (address, peripheral) in connectedPeripherals {
+            if peripheral.identifier.uuidString == peripheralIdentifier {
+                match = address
+                break
+            }
+        }
+        stateLock.unlock()
+
+        guard let address = match else { return false }
+        clearConnectedDevice(address: address)
+        return true
     }
 
     /// Clear connection state for a specific device or all devices
