@@ -173,42 +173,144 @@ open class CBCentralManager: CBManager {
     @available(*, unavailable)
     open class func supports(_ features: CBCentralManager.Feature) -> Bool { fatalError() }
 
-    /// Returns peripherals that match the specified identifiers.
+    /// Returns peripherals that match the specified identifiers, whether or
+    /// not they are advertising.
     ///
-    /// - Parameter identifiers: A list of peripheral identifiers (UUIDs based on device MAC address).
-    /// - Returns: A list of peripherals matching the identifiers.
+    /// This is the route to a peripheral no scan can produce. A connected LE
+    /// peripheral stops advertising, and the link that silences it may be one
+    /// the system holds rather than ours — Android's ACL is shared between
+    /// every GATT client and server on the phone, so a device can sit
+    /// connected, invisible to scanning, after this app has released its own
+    /// client. Bonded devices and system-wide GATT connections are both
+    /// addressable without a sighting, and a `CBPeripheral`'s identifier is
+    /// derived from its address, so an identifier resolves back to a device
+    /// with no radio work at all.
     ///
-    /// - Note: **Android limitation**: Unlike iOS, this method can only return peripherals that are
-    ///   currently connected by this app. CoreBluetooth on iOS can retrieve previously-seen peripherals
-    ///   that are cached by the system, even if not currently connected. On Android, there is no
-    ///   equivalent system cache for BLE peripherals.
+    /// - Parameter identifiers: Peripheral identifiers (UUIDs derived from the device address).
+    /// - Returns: The peripherals found, in the order asked for. Identifiers
+    ///   the system does not know are absent, so the result may be shorter
+    ///   than the request.
     open func retrievePeripherals(withIdentifiers identifiers: [UUID]) -> [CBPeripheral] {
-        stateLock.lock(); defer { stateLock.unlock() }
-        return identifiers.compactMap { uuid in
-            connectedPeripherals.values.first { $0.identifier == uuid }
+        guard !identifiers.isEmpty else { return [] }
+        let wanted = Set(identifiers)
+        var found: [UUID: CBPeripheral] = [:]
+
+        // Ours first: a live peripheral carries its GATT and its discovered
+        // services, which a freshly built one does not.
+        stateLock.lock()
+        for peripheral in connectedPeripherals.values {
+            if wanted.contains(peripheral.identifier) {
+                found[peripheral.identifier] = peripheral
+            }
+        }
+        stateLock.unlock()
+
+        for device in systemConnectedDevices() {
+            record(device, wanted: wanted, into: &found)
+        }
+        if found.count < wanted.count {
+            for device in systemBondedLEDevices() {
+                record(device, wanted: wanted, into: &found)
+            }
+        }
+
+        return identifiers.compactMap { found[$0] }
+    }
+
+    /// Returns the LE peripherals the phone currently holds a connection to —
+    /// including connections opened by other apps and by the system's own
+    /// GATT server profiles, which is what CoreBluetooth reports on iOS.
+    ///
+    /// - Parameter serviceUUIDs: Services to filter by. A peripheral this app
+    ///   has connected to is kept only when its discovered services match. A
+    ///   peripheral held by someone else publishes no service list to us, and
+    ///   is kept rather than guessed away: it may well be the camera the
+    ///   caller is looking for. Pass an empty list to skip filtering.
+    open func retrieveConnectedPeripherals(withServices serviceUUIDs: [CBUUID]) -> [CBPeripheral] {
+        stateLock.lock()
+        let ours = Array(connectedPeripherals.values)
+        stateLock.unlock()
+
+        var byIdentifier: [UUID: CBPeripheral] = [:]
+        for peripheral in ours {
+            byIdentifier[peripheral.identifier] = peripheral
+        }
+        for device in systemConnectedDevices() {
+            let peripheral = CBPeripheral(device: device)
+            if byIdentifier[peripheral.identifier] == nil {
+                byIdentifier[peripheral.identifier] = peripheral
+            }
+        }
+
+        let peripherals = Array(byIdentifier.values)
+        guard !serviceUUIDs.isEmpty else { return peripherals }
+
+        let serviceUUIDStrings = Set(serviceUUIDs.map { $0.uuidString })
+        return peripherals.filter { peripheral in
+            guard let services = peripheral.services else { return true }
+            return services.contains { serviceUUIDStrings.contains($0.uuid.uuidString) }
         }
     }
 
-    /// Returns peripherals that are currently connected and have discovered the specified services.
-    ///
-    /// - Parameter serviceUUIDs: A list of service UUIDs to filter by.
-    /// - Returns: A list of connected peripherals that have the specified services.
-    ///
-    /// - Note: **Android limitation**: Unlike iOS, this method only returns peripherals connected
-    ///   by this app, not system-wide connections. Additionally, the peripheral must have already
-    ///   called `discoverServices()` for the service filtering to work. CoreBluetooth on iOS can
-    ///   return peripherals connected by any app on the system.
-    open func retrieveConnectedPeripherals(withServices serviceUUIDs: [CBUUID]) -> [CBPeripheral] {
-        stateLock.lock(); defer { stateLock.unlock() }
-        guard !serviceUUIDs.isEmpty else {
-            return Array(connectedPeripherals.values)
+    /// Keep a device only when it is one of the identifiers asked for, and
+    /// never over an entry a live peripheral already filled.
+    private func record(_ device: BluetoothDevice,
+                        wanted: Set<UUID>,
+                        into found: inout [UUID: CBPeripheral]) {
+        let peripheral = CBPeripheral(device: device)
+        guard wanted.contains(peripheral.identifier), found[peripheral.identifier] == nil else {
+            return
         }
+        found[peripheral.identifier] = peripheral
+    }
 
-        let serviceUUIDStrings = Set(serviceUUIDs.map { $0.uuidString })
-        return connectedPeripherals.values.filter { peripheral in
-            guard let services = peripheral.services else { return false }
-            return services.contains { serviceUUIDStrings.contains($0.uuid.uuidString) }
+    /// Every LE device the system can name without a scan: the ones it is
+    /// connected to right now (any app, any profile) and the ones bonded to
+    /// this phone. Classic-only bonds are left out — they are not peripherals.
+    private func systemKnownDevices() -> [BluetoothDevice] {
+        var devices = systemConnectedDevices()
+        var seen = Set(devices.map { $0.address })
+
+        for device in systemBondedLEDevices() {
+            guard !seen.contains(device.address) else { continue }
+            seen.insert(device.address)
+            devices.append(device)
         }
+        return devices
+    }
+
+    /// The LE devices the phone is connected to right now — any app, any
+    /// profile, including the system's own GATT server. This is what
+    /// CoreBluetooth reports on iOS, and the reason a camera nobody in this
+    /// app is talking to can still be addressable.
+    private func systemConnectedDevices() -> [BluetoothDevice] {
+        guard hasPermission(android.Manifest.permission.BLUETOOTH_CONNECT) else {
+            logger.error("CBCentralManager.systemConnectedDevices: Missing BLUETOOTH_CONNECT permission.")
+            return []
+        }
+        guard let connected = bluetoothManager?.getConnectedDevices(BluetoothProfile.GATT) else {
+            return []
+        }
+        var devices: [BluetoothDevice] = []
+        for device in connected {
+            devices.append(device)
+        }
+        return devices
+    }
+
+    /// The LE devices bonded to this phone. Classic-only bonds are left out —
+    /// they are not peripherals.
+    private func systemBondedLEDevices() -> [BluetoothDevice] {
+        guard hasPermission(android.Manifest.permission.BLUETOOTH_CONNECT) else {
+            logger.error("CBCentralManager.systemBondedLEDevices: Missing BLUETOOTH_CONNECT permission.")
+            return []
+        }
+        guard let bonded = adapter?.getBondedDevices() else { return [] }
+        var devices: [BluetoothDevice] = []
+        for device in bonded where device.type != BluetoothDevice.DEVICE_TYPE_CLASSIC {
+            devices.append(device)
+        }
+        return devices
     }
 
     open func connect(_ peripheral: CBPeripheral, options: [String : Any]? = nil) {

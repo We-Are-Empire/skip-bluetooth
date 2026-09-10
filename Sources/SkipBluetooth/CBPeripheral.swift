@@ -145,6 +145,19 @@ open class CBPeripheral: CBPeer {
         self.gatt = nil
     }
 
+    /// A peripheral the system already knows — bonded, or connected right now
+    /// by another app — rather than one a scan produced. It carries no GATT
+    /// until `connect` opens one, exactly like the scan-result case, and its
+    /// identifier derives from the address the same way, so it is the same
+    /// peripheral to every caller either route returns it to.
+    internal init(device: BluetoothDevice) {
+        super.init(macAddress: device.address)
+        self._name = device.name
+        self._address = device.address
+        self.device = device
+        self.gatt = nil
+    }
+
     internal init(gatt: BluetoothGatt, gattDelegate: BleGattCallback) {
         super.init(macAddress: gatt.device.address)
         self._name = gatt.device.name
