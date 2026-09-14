@@ -50,6 +50,11 @@ open class CBCentralManager: CBManager {
     // This prevents multiple reconnection attempts after bonding
     private var connectedDeviceAddresses: Set<String> = []
 
+    // Addresses a caller asked to connect to, from `connect` until that
+    // connection is cancelled or ends. A bond completing for any other
+    // address opens no connection: nobody is waiting for it.
+    private var requestedConnectAddresses: Set<String> = []
+
     // BLE-audit F1: the four collections above are read on Android binder threads
     // (every GATT callback runs `central.getPeripheral(...)` BEFORE its main-actor hop)
     // and mutated from both binder + main threads. With >1 sensor connected Android
@@ -324,6 +329,9 @@ open class CBCentralManager: CBManager {
         }
 
         logger.log("CBCentralManager.connect: Connecting to \(peripheral.device)")
+        stateLock.lock()
+        requestedConnectAddresses.insert(device.address)
+        stateLock.unlock()
         tryConnect(to: device)
     }
     
@@ -345,6 +353,7 @@ open class CBCentralManager: CBManager {
         // either lands first and gets the disconnect path below, or lands
         // after the close that deregisters it.
         stateLock.lock()
+        requestedConnectAddresses.remove(address)
         let trackedGatt = connectedGatts[address]
         let isEstablished = connectedPeripherals[address] != nil
         if !isEstablished, let pendingGatt = trackedGatt {
@@ -516,10 +525,20 @@ extension CBCentralManager {
     }
 
     /// Look up a peripheral by device address (called by BleGattCallback, on a binder thread)
-    /// Bonding succeeded: connect if this bond was what we were waiting on, and
-    /// replay any ATT operations the peer had answered with the pairing prompt.
+    /// Bonding succeeded: replay any ATT operations the peer had answered with
+    /// the pairing prompt, and connect only if a caller's connect to this
+    /// device is still outstanding. Android can broadcast `BOND_BONDED` again
+    /// for a device whose link has already ended, and a connection opened for
+    /// that broadcast belongs to no caller.
     func onDeviceBonded(_ device: BluetoothDevice) {
         getPeripheral(for: device.address)?.resumeOperationsAwaitingBond()
+        stateLock.lock()
+        let isRequested = requestedConnectAddresses.contains(device.address)
+        stateLock.unlock()
+        guard isRequested else {
+            logger.debug("CBCentralManager.onDeviceBonded: no connect outstanding for \(device.address), not connecting")
+            return
+        }
         tryConnect(to: device)
     }
 
@@ -574,6 +593,7 @@ extension CBCentralManager {
             // Clear specific device
             logger.debug("CBCentralManager.clearConnectedDevice: clearing address \(address)")
             connectedDeviceAddresses.remove(address)
+            requestedConnectAddresses.remove(address)
             connectedPeripherals.removeValue(forKey: address)
 
             if let gatt = connectedGatts.removeValue(forKey: address) {
@@ -590,6 +610,7 @@ extension CBCentralManager {
                 gatt.close()
             }
             connectedDeviceAddresses.removeAll()
+            requestedConnectAddresses.removeAll()
             connectedPeripherals.removeAll()
             connectedGatts.removeAll()
         }
