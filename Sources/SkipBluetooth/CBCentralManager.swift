@@ -30,6 +30,9 @@ open class CBCentralManager: CBManager {
     private var discoveredAddresses: Set<String> = []
     /// Whether to suppress duplicate scan results (mirrors iOS allowDuplicates: false).
     private var suppressDuplicates: Bool = false
+    /// Whether an LE scan this central started is still running, and with which filter. Guarded
+    /// by `stateLock`.
+    internal var scanGate = ScanStartGate()
 
     private lazy var bondingReceiver: BondCallback! = BondCallback(
         completion: { device in
@@ -84,6 +87,14 @@ open class CBCentralManager: CBManager {
         super.init()
 
         stateChangedHandler = {
+            // A radio leaving the powered-on state ends the scan without a callback, so the next
+            // request after power-on has to start one. Recorded before the delegate hears the
+            // change, because the delegate is what asks for the scan again.
+            if self.state != CBManagerState.poweredOn {
+                self.stateLock.lock()
+                self.scanGate.scanEnded()
+                self.stateLock.unlock()
+            }
             delegate?.centralManagerDidUpdateState(self)
         }
 
@@ -135,15 +146,19 @@ open class CBCentralManager: CBManager {
 
         // Android requires one ScanFilter per service UUID — setServiceUuid() overwrites, not appends.
         var scanFilters: [ScanFilter] = []
+        // The filter as the scan gate compares it: service UUIDs, then solicitation UUIDs.
+        var filterKey: [String] = []
         if let serviceUUIDs = serviceUUIDs {
             for uuid in serviceUUIDs {
                 let filterBuilder = ScanFilter.Builder()
                 filterBuilder.setServiceUuid(ParcelUuid(uuid.kotlin()))
                 scanFilters.append(filterBuilder.build())
+                filterKey.append("service:" + uuid.uuidString)
             }
         } else {
             // No filter — scan for all devices
             scanFilters.append(ScanFilter.Builder().build())
+            filterKey.append("all")
         }
 
         // SKIP NOWARN
@@ -152,7 +167,23 @@ open class CBCentralManager: CBManager {
                 let filterBuilder = ScanFilter.Builder()
                 filterBuilder.setServiceSolicitationUuid(ParcelUuid(uuid.kotlin()))
                 scanFilters.append(filterBuilder.build())
+                filterKey.append("solicited:" + uuid.uuidString)
             }
+        }
+
+        // A request for the scan that is already running starts nothing: Android counts every
+        // startScan against five per 30 s and returns nothing after that. See `ScanStartGate`.
+        stateLock.lock()
+        let decision = scanGate.request(filter: filterKey)
+        stateLock.unlock()
+        switch decision {
+        case .keepRunning:
+            logger.debug("CBCentralManager.scanForPeripherals: the scan is already running with this filter")
+            return
+        case .restart:
+            scanner?.stopScan(scanDelegate)
+        case .start:
+            break
         }
 
         let settings = settingsBuilder.build()
@@ -171,6 +202,7 @@ open class CBCentralManager: CBManager {
         logger.info("CentralManager.stopScan: Stopping Scan")
         scanner?.stopScan(scanDelegate)
         stateLock.lock()
+        scanGate.scanEnded()
         discoveredAddresses.removeAll()
         stateLock.unlock()
     }
@@ -434,6 +466,10 @@ open class CBCentralManager: CBManager {
         override func onScanFailed(errorCode: Int) {
             super.onScanFailed(errorCode)
             logger.warning("BleScanCallback.onScanFailed: Scan failed with error: \(errorCode)")
+            // No scan is running after a failure, so the next request starts one.
+            central.stateLock.lock()
+            central.scanGate.scanEnded()
+            central.stateLock.unlock()
         }
     }
 
