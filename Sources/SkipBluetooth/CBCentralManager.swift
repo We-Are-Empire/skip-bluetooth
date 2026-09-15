@@ -40,7 +40,14 @@ open class CBCentralManager: CBManager {
         },
         bondFailed: { device, wasBonding in
             self.onDeviceBondFailed(device, wasBonding: wasBonding)
+        },
+        bondLost: { device in
+            self.onDeviceBondLost(device)
         })
+
+    /// Receives `ACTION_KEY_MISSING` (API 36). Registered on its own, exported: the broadcast
+    /// comes from the Bluetooth stack's process, not this app's.
+    private var bondLossReceiver: BondCallback? = nil
 
     // Support multiple simultaneous connections
     // Maps device address to its BluetoothGatt connection
@@ -104,11 +111,33 @@ open class CBCentralManager: CBManager {
             },
             bondFailed: { device, wasBonding in
                 self.onDeviceBondFailed(device, wasBonding: wasBonding)
+            },
+            bondLost: { device in
+                self.onDeviceBondLost(device)
             })
 
         let filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
         let context = ProcessInfo.processInfo.androidContext
         context.registerReceiver(bondingReceiver, filter)
+
+        // A device that no longer holds this phone's bond keys fails its connection with an
+        // ordinary status; the stack announces the loss only in this broadcast. It is sent to
+        // holders of BLUETOOTH_CONNECT, the permission every connect here already needs, so a
+        // permission granted after launch still receives it.
+        if Build.VERSION.SDK_INT >= 36 {
+            let lossReceiver = BondCallback(
+                completion: { _ in },
+                bondFailed: { _, _ in },
+                bondLost: { device in
+                    self.onDeviceBondLost(device)
+                })
+            bondLossReceiver = lossReceiver
+            let keyMissingFilter = IntentFilter(BondBroadcastClassifier.actionKeyMissing)
+            context.registerReceiver(lossReceiver, keyMissingFilter, Context.RECEIVER_EXPORTED)
+            if !hasPermission(android.Manifest.permission.BLUETOOTH_CONNECT) {
+                logger.info("CBCentralManager: BLUETOOTH_CONNECT is not granted yet; key-missing broadcasts arrive once it is")
+            }
+        }
 
         // Android leaves a GATT client open when the app process ends; iOS does
         // not. See `ProcessTerminationCleanup`.
@@ -479,51 +508,58 @@ open class CBCentralManager: CBManager {
         /// that just failed (cancelled PIN, timeout, refusal) from an unbond of
         /// a device that was already paired.
         private let bondFailed: (BluetoothDevice, Bool) -> Void
+        /// The device no longer holds this phone's bond keys (`ACTION_KEY_MISSING`).
+        private let bondLost: (BluetoothDevice) -> Void
         init(completion: @escaping (BluetoothDevice) -> Void,
-             bondFailed: @escaping (BluetoothDevice, Bool) -> Void) {
+             bondFailed: @escaping (BluetoothDevice, Bool) -> Void,
+             bondLost: @escaping (BluetoothDevice) -> Void) {
             self.completion = completion
             self.bondFailed = bondFailed
+            self.bondLost = bondLost
         }
 
         override func onReceive(context: Context?, intent: Intent?) {
             let action = intent?.action
-            switch (action) {
-            case BluetoothDevice.ACTION_BOND_STATE_CHANGED:
-                // Use version-appropriate API for getParcelableExtra
-                let device: BluetoothDevice?
-                if Build.VERSION.SDK_INT >= 33 {
-                    device = intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.self.java)
-                } else {
-                    // Deprecated but required for API < 33
-                    device = intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as? BluetoothDevice
-                }
-                let bondState = intent?.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
-                switch (bondState) {
-                case BluetoothDevice.BOND_BONDED:
-                    guard let device = device else {
-                        logger.error("BondCallback.onReceive: Device is nil")
-                        return
-                    }
+            // Use version-appropriate API for getParcelableExtra
+            let device: BluetoothDevice?
+            if Build.VERSION.SDK_INT >= 33 {
+                device = intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.self.java)
+            } else {
+                // Deprecated but required for API < 33
+                device = intent?.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as? BluetoothDevice
+            }
+            guard let device = device else {
+                logger.error("BondCallback.onReceive: Device is nil for \(action ?? "nil")")
+                return
+            }
 
-                    logger.debug("StateChangedReceiver: Bonded with \(device?.name ?? "nil")")
-                    completion(device)
-                    break
-                case BluetoothDevice.BOND_BONDING:
-                    logger.debug("StateChangedReceiver: Bonding in progress.")
-                    break
-                case BluetoothDevice.BOND_NONE:
-                    logger.debug("StateChangedReceiver: Bonding failed or broken")
-                    guard let device = device else {
-                        logger.error("BondCallback.onReceive: Device is nil")
-                        return
-                    }
-                    let previous = intent?.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
-                                                       BluetoothDevice.ERROR)
-                    bondFailed(device, previous == BluetoothDevice.BOND_BONDING)
-                    break
-                default:
-                    break
-                }
+            let bondState: Int
+            let previousBondState: Int
+            if action == BondBroadcastClassifier.actionKeyMissing {
+                bondState = device.bondState
+                previousBondState = BluetoothDevice.ERROR
+            } else {
+                bondState = intent?.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR) ?? BluetoothDevice.ERROR
+                previousBondState = intent?.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR) ?? BluetoothDevice.ERROR
+            }
+
+            switch BondBroadcastClassifier.classify(action: action, bondState: bondState, previousBondState: previousBondState) {
+            case .bonded:
+                logger.debug("StateChangedReceiver: Bonded with \(device.name ?? "nil")")
+                completion(device)
+            case .bonding:
+                logger.debug("StateChangedReceiver: Bonding in progress.")
+            case .pairingCancelled:
+                logger.debug("StateChangedReceiver: Bonding failed")
+                bondFailed(device, true)
+            case .unbonded:
+                logger.debug("StateChangedReceiver: Bond removed")
+                bondFailed(device, false)
+            case .bondLost:
+                logger.info("BondCallback.onReceive: key missing for bonded device \(device.address)")
+                bondLost(device)
+            case .ignored:
+                logger.debug("BondCallback.onReceive: ignoring \(action ?? "nil") with bond state \(bondState)")
             }
         }
     }
@@ -586,6 +622,18 @@ extension CBCentralManager {
     func onDeviceBondFailed(_ device: BluetoothDevice, wasBonding: Bool) {
         guard wasBonding else { return }
         getPeripheral(for: device.address)?.failOperationsAwaitingBond()
+    }
+
+    /// The device no longer holds this phone's bond keys. CoreBluetooth has no callback for
+    /// this: it reports the loss as `peerRemovedPairingInformation` on the failure itself, and
+    /// Android reports that failure with an ordinary status, before or after this broadcast.
+    /// Delivered through the callback pipeline so it stays ordered with the connection callbacks
+    /// a delegate pairs it with.
+    func onDeviceBondLost(_ device: BluetoothDevice) {
+        let peripheral = getPeripheral(for: device.address) ?? CBPeripheral(device: device)
+        BleCallbackPipeline.shared.dispatch {
+            self.delegate?.centralManagerDidLoseBond(self, peripheral: peripheral)
+        }
     }
 
     func getPeripheral(for address: String) -> CBPeripheral? {
@@ -682,6 +730,10 @@ public protocol CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, timestamp: CFAbsoluteTime, isReconnecting: Bool, error: (any Error)?)
     func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral)
 
+    /// Android only: the peripheral no longer holds this phone's bond keys (`ACTION_KEY_MISSING`,
+    /// API 36). CoreBluetooth folds the same fact into `peerRemovedPairingInformation`.
+    func centralManagerDidLoseBond(_ central: CBCentralManager, peripheral: CBPeripheral)
+
     @available(*, unavailable)
     func centralManagerDidUpdateANCSAuthorizationFor(central: CBCentralManager, peripheral: CBPeripheral)
 }
@@ -697,6 +749,7 @@ extension CBCentralManagerDelegate {
     @available(*, unavailable)
     public func centralManagerDidUpdateANCSAuthorizationFor(central: CBCentralManager, peripheral: CBPeripheral) { return }
     public func centralManagerDidDisconnectPeripheral(_ central: CBCentralManager, peripheral: CBPeripheral, error: (any Error)?) { }
+    public func centralManagerDidLoseBond(_ central: CBCentralManager, peripheral: CBPeripheral) { }
 }
 
 #endif
