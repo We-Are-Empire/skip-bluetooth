@@ -130,6 +130,17 @@ open class CBPeripheral: CBPeer {
     /// callback: replayed on `BOND_BONDED`, failed with `CBATTError`
     /// `insufficientAuthentication` if bonding ends in `BOND_NONE`.
     private var operationsAwaitingBond: [GattOperation] = []
+    /// Whether this wait has already asked Android to bond. One `createBond()`
+    /// per wait: a second operation answered with the same prompt joins the
+    /// wait rather than asking again.
+    private var bondRequested = false
+    /// Whether `BOND_BONDING` has been broadcast for this device since the wait
+    /// began — the proof that a prompt exists.
+    private var bondingSeen = false
+    /// The wait an armed no-bond check belongs to. Every path that ends a wait
+    /// takes the next token, so a check armed for an earlier wait — or for an
+    /// earlier connection — finds its token stale and does nothing.
+    private var bondWaitToken = 0
     /// Lock for thread-safe queue access
     private let queueLock = NSLock()
 
@@ -315,12 +326,110 @@ open class CBPeripheral: CBPeer {
     /// `GATT_INSUFFICIENT_ENCRYPTION` on a device that is not bonded yet — the
     /// peer asking to pair, not a failure. No delegate callback is delivered,
     /// matching CoreBluetooth, which stays silent for the duration of pairing.
+    ///
+    /// The first operation of a wait also asks Android for the bond, because the
+    /// prompt the peer is waiting on is not something Android promises to raise
+    /// on its own — see `BondRequestGate`.
     internal func deferCurrentOperationUntilBonded() {
         queueLock.lock()
         if let operation = currentOperation {
             operationsAwaitingBond.append(operation)
         }
         currentOperation = nil
+        let shouldRequestBond = !bondRequested && !operationsAwaitingBond.isEmpty
+        if shouldRequestBond {
+            bondRequested = true
+        }
+        queueLock.unlock()
+
+        guard shouldRequestBond, let device = device else { return }
+        requestBondForWait(device)
+    }
+
+    /// Ask Android to bond, and decide what the wait is worth.
+    private func requestBondForWait(_ device: BluetoothDevice) {
+        let address = device.address
+        switch BondRequestGate.onPark(bondState: device.bondState) {
+        case .replay:
+            resumeOperationsAwaitingBond()
+        case .park:
+            // Already bonding: the prompt exists, so the wait is unbounded and
+            // nothing is armed.
+            noteBondingStarted()
+        case .fail:
+            failOperationsAwaitingBond()
+        case .requestBond:
+            logger.info("CBPeripheral: createBond requested for \(address)")
+            let started = device.createBond()
+            let stateAfterRequest = device.bondState
+            switch BondRequestGate.afterRequest(started: started, bondState: stateAfterRequest) {
+            case .replay:
+                resumeOperationsAwaitingBond()
+            case .fail:
+                logger.info("CBPeripheral: createBond returned false for \(address) (state \(stateAfterRequest))")
+                failOperationsAwaitingBond()
+            case .park, .requestBond:
+                armNoBondCheck(address: address)
+            }
+        }
+    }
+
+    /// Give the bond that was asked for its window to reach `BOND_BONDING`.
+    ///
+    /// A coroutine delay, not a `Timer`: an idle Android app pumps no run loop,
+    /// so a `Timer` scheduled here would never fire. The main actor is the same
+    /// one `BleCallbackPipeline` delivers on, which is the actor every caller of
+    /// this file's deferral methods is already on.
+    private func armNoBondCheck(address: String) {
+        queueLock.lock()
+        bondWaitToken += 1
+        let token = bondWaitToken
+        queueLock.unlock()
+
+        let seconds = BondRequestGate.bondStartTimeoutSeconds
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            self.noBondCheckFired(token: token, address: address, seconds: seconds)
+        }
+    }
+
+    /// The armed window has elapsed. It acts only for the wait it was armed for,
+    /// and only while that wait still holds operations.
+    private func noBondCheckFired(token: Int, address: String, seconds: Double) {
+        queueLock.lock()
+        let isCurrent = token == bondWaitToken && !operationsAwaitingBond.isEmpty
+        let seen = bondingSeen
+        queueLock.unlock()
+        guard isCurrent else { return }
+
+        let bondState = device?.bondState ?? BondRequestGate.bondNone
+        switch BondRequestGate.onCheck(bondingSeen: seen, bondState: bondState) {
+        case .replay:
+            resumeOperationsAwaitingBond()
+        case .fail:
+            logger.info("CBPeripheral: no bond started for \(address) within \(Int(seconds)) s")
+            failOperationsAwaitingBond()
+        case .park, .requestBond:
+            break
+        }
+    }
+
+    /// Android has broadcast `BOND_BONDING` for this device: the prompt exists,
+    /// so the wait becomes unbounded again and the armed check is retired.
+    internal func noteBondingStarted() {
+        queueLock.lock()
+        bondingSeen = true
+        bondWaitToken += 1
+        queueLock.unlock()
+    }
+
+    /// The link ended. The wait ends with it, so a check armed for it cannot
+    /// fail operations a later connection parks.
+    internal func cancelBondWait() {
+        queueLock.lock()
+        bondWaitToken += 1
+        bondRequested = false
+        bondingSeen = false
         queueLock.unlock()
     }
 
@@ -330,6 +439,9 @@ open class CBPeripheral: CBPeer {
         queueLock.lock()
         let held = operationsAwaitingBond
         operationsAwaitingBond = []
+        bondRequested = false
+        bondingSeen = false
+        bondWaitToken += 1
         // Ahead of anything queued since: these were issued first.
         operationQueue = held + operationQueue
         let shouldProcess = !isOperationInProgress && !operationQueue.isEmpty
@@ -350,6 +462,9 @@ open class CBPeripheral: CBPeer {
         queueLock.lock()
         let held = operationsAwaitingBond
         operationsAwaitingBond = []
+        bondRequested = false
+        bondingSeen = false
+        bondWaitToken += 1
         queueLock.unlock()
 
         guard !held.isEmpty else { return }

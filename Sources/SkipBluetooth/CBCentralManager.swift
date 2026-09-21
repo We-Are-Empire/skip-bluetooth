@@ -43,6 +43,9 @@ open class CBCentralManager: CBManager {
         },
         bondLost: { device in
             self.onDeviceBondLost(device)
+        },
+        bondStarted: { device in
+            self.onDeviceBondStarted(device)
         })
 
     /// Receives `ACTION_KEY_MISSING` (API 36). Registered on its own, exported: the broadcast
@@ -114,6 +117,9 @@ open class CBCentralManager: CBManager {
             },
             bondLost: { device in
                 self.onDeviceBondLost(device)
+            },
+            bondStarted: { device in
+                self.onDeviceBondStarted(device)
             })
 
         let filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
@@ -130,7 +136,8 @@ open class CBCentralManager: CBManager {
                 bondFailed: { _, _ in },
                 bondLost: { device in
                     self.onDeviceBondLost(device)
-                })
+                },
+                bondStarted: { _ in })
             bondLossReceiver = lossReceiver
             let keyMissingFilter = IntentFilter(BondBroadcastClassifier.actionKeyMissing)
             context.registerReceiver(lossReceiver, keyMissingFilter, Context.RECEIVER_EXPORTED)
@@ -510,12 +517,16 @@ open class CBCentralManager: CBManager {
         private let bondFailed: (BluetoothDevice, Bool) -> Void
         /// The device no longer holds this phone's bond keys (`ACTION_KEY_MISSING`).
         private let bondLost: (BluetoothDevice) -> Void
+        /// Bonding started: a prompt exists for this device.
+        private let bondStarted: (BluetoothDevice) -> Void
         init(completion: @escaping (BluetoothDevice) -> Void,
              bondFailed: @escaping (BluetoothDevice, Bool) -> Void,
-             bondLost: @escaping (BluetoothDevice) -> Void) {
+             bondLost: @escaping (BluetoothDevice) -> Void,
+             bondStarted: @escaping (BluetoothDevice) -> Void) {
             self.completion = completion
             self.bondFailed = bondFailed
             self.bondLost = bondLost
+            self.bondStarted = bondStarted
         }
 
         override func onReceive(context: Context?, intent: Intent?) {
@@ -548,7 +559,8 @@ open class CBCentralManager: CBManager {
                 logger.debug("StateChangedReceiver: Bonded with \(device.name ?? "nil")")
                 completion(device)
             case .bonding:
-                logger.debug("StateChangedReceiver: Bonding in progress.")
+                logger.debug("StateChangedReceiver: Bonding in progress with \(device.address)")
+                bondStarted(device)
             case .pairingCancelled:
                 logger.debug("StateChangedReceiver: Bonding failed")
                 bondFailed(device, true)
@@ -624,6 +636,13 @@ extension CBCentralManager {
         getPeripheral(for: device.address)?.failOperationsAwaitingBond()
     }
 
+    /// Bonding started. A peripheral holding operations for the bond it asked
+    /// for now has its proof that a prompt exists, so it waits as long as the
+    /// prompt lives rather than as long as the window it armed.
+    func onDeviceBondStarted(_ device: BluetoothDevice) {
+        getPeripheral(for: device.address)?.noteBondingStarted()
+    }
+
     /// The device no longer holds this phone's bond keys. CoreBluetooth has no callback for
     /// this: it reports the loss as `peerRemovedPairingInformation` on the failure itself, and
     /// Android reports that failure with an ordinary status, before or after this broadcast.
@@ -678,7 +697,9 @@ extension CBCentralManager {
             logger.debug("CBCentralManager.clearConnectedDevice: clearing address \(address)")
             connectedDeviceAddresses.remove(address)
             requestedConnectAddresses.remove(address)
-            connectedPeripherals.removeValue(forKey: address)
+            // The link is going away, and with it any wait for a bond it asked
+            // for: nothing armed for this connection may act on a later one.
+            connectedPeripherals.removeValue(forKey: address)?.cancelBondWait()
 
             if let gatt = connectedGatts.removeValue(forKey: address) {
                 logger.debug("CBCentralManager.clearConnectedDevice: closing GATT for \(address)")
@@ -695,6 +716,9 @@ extension CBCentralManager {
             }
             connectedDeviceAddresses.removeAll()
             requestedConnectAddresses.removeAll()
+            for peripheral in connectedPeripherals.values {
+                peripheral.cancelBondWait()
+            }
             connectedPeripherals.removeAll()
             connectedGatts.removeAll()
         }
