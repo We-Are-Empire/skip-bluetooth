@@ -691,15 +691,16 @@ extension CBCentralManager {
         // BLE-audit F1: atomic multi-collection clear under the lock. The gatt
         // disconnect()/close() calls below don't re-enter (Android fires their callbacks
         // asynchronously on a binder thread), so holding the lock across them is safe.
-        stateLock.lock(); defer { stateLock.unlock() }
+        var cleared: [CBPeripheral] = []
+        stateLock.lock()
         if let address = address {
             // Clear specific device
             logger.debug("CBCentralManager.clearConnectedDevice: clearing address \(address)")
             connectedDeviceAddresses.remove(address)
             requestedConnectAddresses.remove(address)
-            // The link is going away, and with it any wait for a bond it asked
-            // for: nothing armed for this connection may act on a later one.
-            connectedPeripherals.removeValue(forKey: address)?.cancelBondWait()
+            if let peripheral = connectedPeripherals.removeValue(forKey: address) {
+                cleared.append(peripheral)
+            }
 
             if let gatt = connectedGatts.removeValue(forKey: address) {
                 logger.debug("CBCentralManager.clearConnectedDevice: closing GATT for \(address)")
@@ -716,11 +717,18 @@ extension CBCentralManager {
             }
             connectedDeviceAddresses.removeAll()
             requestedConnectAddresses.removeAll()
-            for peripheral in connectedPeripherals.values {
-                peripheral.cancelBondWait()
-            }
+            cleared = Array(connectedPeripherals.values)
             connectedPeripherals.removeAll()
             connectedGatts.removeAll()
+        }
+        stateLock.unlock()
+
+        // The links are going away, and with them any wait for a bond they asked
+        // for: nothing armed for one may act on a later connection. Outside the
+        // lock, because `cancelBondWait` takes the peripheral's own queue lock
+        // and no method here holds one lock across another.
+        for peripheral in cleared {
+            peripheral.cancelBondWait()
         }
     }
 }

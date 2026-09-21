@@ -96,6 +96,14 @@ internal enum GattOperation {
     case writeDescriptorValue(BluetoothGattDescriptor, CBDescriptor, ByteArray)
 }
 
+/// Which armed check a wait for a bond is running.
+internal enum BondWaitPhase {
+    /// Looking again before asking: the stack's own pairing may already be in flight.
+    case grace
+    /// A bond was asked for, and must reach `BOND_BONDING` inside the window.
+    case window
+}
+
 open class CBPeripheral: CBPeer {
     private var _name: String?
     private var _address: String?
@@ -327,27 +335,27 @@ open class CBPeripheral: CBPeer {
     /// peer asking to pair, not a failure. No delegate callback is delivered,
     /// matching CoreBluetooth, which stays silent for the duration of pairing.
     ///
-    /// The first operation of a wait also asks Android for the bond, because the
-    /// prompt the peer is waiting on is not something Android promises to raise
-    /// on its own — see `BondRequestGate`.
+    /// The first operation of a wait also starts the bond watch, because the
+    /// prompt the peer is waiting on is not something Android always raises on
+    /// its own — see `BondRequestGate`.
     internal func deferCurrentOperationUntilBonded() {
         queueLock.lock()
         if let operation = currentOperation {
             operationsAwaitingBond.append(operation)
         }
         currentOperation = nil
-        let shouldRequestBond = !bondRequested && !operationsAwaitingBond.isEmpty
-        if shouldRequestBond {
+        let shouldWatchBond = !bondRequested && !operationsAwaitingBond.isEmpty
+        if shouldWatchBond {
             bondRequested = true
         }
         queueLock.unlock()
 
-        guard shouldRequestBond, let device = device else { return }
-        requestBondForWait(device)
+        guard shouldWatchBond, let device = device else { return }
+        beginBondWait(device)
     }
 
-    /// Ask Android to bond, and decide what the wait is worth.
-    private func requestBondForWait(_ device: BluetoothDevice) {
+    /// Decide what a wait that has just begun is worth.
+    private func beginBondWait(_ device: BluetoothDevice) {
         let address = device.address
         switch BondRequestGate.onPark(bondState: device.bondState) {
         case .replay:
@@ -358,58 +366,78 @@ open class CBPeripheral: CBPeer {
             noteBondingStarted()
         case .fail:
             failOperationsAwaitingBond()
-        case .requestBond:
-            logger.info("CBPeripheral: createBond requested for \(address)")
-            let started = device.createBond()
-            let stateAfterRequest = device.bondState
-            switch BondRequestGate.afterRequest(started: started, bondState: stateAfterRequest) {
-            case .replay:
-                resumeOperationsAwaitingBond()
-            case .fail:
-                logger.info("CBPeripheral: createBond returned false for \(address) (state \(stateAfterRequest))")
-                failOperationsAwaitingBond()
-            case .park, .requestBond:
-                armNoBondCheck(address: address)
-            }
+        case .awaitGrace, .requestBond:
+            // Never ask straight away. The stack starts its own pairing on this
+            // same refusal, and for its first few hundred milliseconds that is
+            // indistinguishable from no pairing at all.
+            armBondWaitCheck(address: address, phase: .grace)
         }
     }
 
-    /// Give the bond that was asked for its window to reach `BOND_BONDING`.
+    /// Ask Android for the bond, once, and give it a window to start.
+    private func requestBondNow(_ device: BluetoothDevice) {
+        let address = device.address
+        logger.info("CBPeripheral: createBond requested for \(address)")
+        let started = device.createBond()
+        let stateAfterRequest = device.bondState
+        switch BondRequestGate.afterRequest(started: started, bondState: stateAfterRequest) {
+        case .replay:
+            resumeOperationsAwaitingBond()
+        case .fail:
+            logger.info("CBPeripheral: createBond returned false for \(address) (state \(stateAfterRequest))")
+            failOperationsAwaitingBond()
+        case .park, .requestBond, .awaitGrace:
+            armBondWaitCheck(address: address, phase: .window)
+        }
+    }
+
+    /// Arm the check for this phase of the wait.
     ///
     /// A coroutine delay, not a `Timer`: an idle Android app pumps no run loop,
     /// so a `Timer` scheduled here would never fire. The main actor is the same
     /// one `BleCallbackPipeline` delivers on, which is the actor every caller of
     /// this file's deferral methods is already on.
-    private func armNoBondCheck(address: String) {
+    private func armBondWaitCheck(address: String, phase: BondWaitPhase) {
+        let seconds = phase == BondWaitPhase.grace
+            ? BondRequestGate.stackPairingGraceSeconds
+            : BondRequestGate.bondStartTimeoutSeconds
+
         queueLock.lock()
         bondWaitToken += 1
         let token = bondWaitToken
         queueLock.unlock()
 
-        let seconds = BondRequestGate.bondStartTimeoutSeconds
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            self.noBondCheckFired(token: token, address: address, seconds: seconds)
+            self.bondWaitCheckFired(token: token, address: address, phase: phase, seconds: seconds)
         }
     }
 
-    /// The armed window has elapsed. It acts only for the wait it was armed for,
+    /// An armed check has elapsed. It acts only for the wait it was armed for,
     /// and only while that wait still holds operations.
-    private func noBondCheckFired(token: Int, address: String, seconds: Double) {
+    private func bondWaitCheckFired(token: Int, address: String, phase: BondWaitPhase, seconds: Double) {
         queueLock.lock()
         let isCurrent = token == bondWaitToken && !operationsAwaitingBond.isEmpty
         let seen = bondingSeen
         queueLock.unlock()
-        guard isCurrent else { return }
+        guard isCurrent, let device = device else { return }
 
-        let bondState = device?.bondState ?? BondRequestGate.bondNone
-        switch BondRequestGate.onCheck(bondingSeen: seen, bondState: bondState) {
+        let bondState = device.bondState
+        let decision = phase == BondWaitPhase.grace
+            ? BondRequestGate.onGrace(bondingSeen: seen, bondState: bondState)
+            : BondRequestGate.onCheck(bondingSeen: seen, bondState: bondState)
+
+        switch decision {
         case .replay:
             resumeOperationsAwaitingBond()
+        case .requestBond:
+            requestBondNow(device)
         case .fail:
             logger.info("CBPeripheral: no bond started for \(address) within \(Int(seconds)) s")
             failOperationsAwaitingBond()
-        case .park, .requestBond:
+        case .park, .awaitGrace:
+            // The stack is pairing after all. Nothing is re-armed: a prompt runs
+            // to its own outcome.
             break
         }
     }
