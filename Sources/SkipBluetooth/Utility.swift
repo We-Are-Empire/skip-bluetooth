@@ -127,7 +127,11 @@ internal func connectionParityError(status: Int, message: String? = nil) -> NSEr
         // peerRemovedPairingInformation, which is what tells a caller to prompt
         // for a re-pair instead of silently retrying.
         code = 14
-    } else if status == 8 || status == 34 {
+    } else if status == 8 || status == 34 || status == 147 {
+        // Supervision timeout (8), link-supervision timeout on the local side
+        // (34), and GATT_CONNECTION_TIMEOUT (147, 0x93) — the status Android
+        // 15 and later reports both for a body that powered off mid-link and
+        // for a connect that never completed.
         code = 6
     } else if status == 19 || status == 22 {
         code = 7
