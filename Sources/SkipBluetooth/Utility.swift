@@ -26,6 +26,10 @@ internal func hasPermission(_ permission: String) -> Bool {
 /// userInfo key carrying the original Android GATT status.
 internal let kGATTStatusKey = "SkipBluetoothGATTStatus"
 
+/// The statuses that mean authentication failed: HCI authentication failure
+/// (5), PIN-or-key-missing (6), MIC failure (61), GATT_AUTH_FAIL (137).
+internal let kAuthenticationStatuses: Set<Int> = [5, 6, 61, 137]
+
 /// An ATT-context failure — a GATT operation callback (`onServicesDiscovered`,
 /// `onCharacteristicRead`, and friends).
 ///
@@ -91,18 +95,17 @@ internal func attOutcome(status: Int, gatt: BluetoothGatt, message: String? = ni
 
 /// A connection failure classified with the bond state taken into account.
 ///
-/// Stays in `CBErrorDomain`: CoreBluetooth documents the
-/// `centralManager(_:didFailToConnect:error:)` error as a `CBError`, and never
-/// delivers a `CBATTError` there — authentication surfaces on iOS as an ATT
-/// failure on the first secure operation, not as a connect failure.
+/// skip-bluetooth-wrapper is the one consumer, and it classifies on domain and
+/// code: `CBATTErrorDomain` 5 is "pairing was not completed", which is the same
+/// outcome `failOperationsAwaitingBond()` reports for a held operation.
 internal func connectionFailureError(status: Int, gatt: BluetoothGatt, message: String? = nil) -> NSError {
-    let isAuthFailure = (status == 5 || status == 6 || status == 61 || status == 137)
-    if isAuthFailure && !isDeviceBonded(gatt) {
+    if kAuthenticationStatuses.contains(status) && !isDeviceBonded(gatt) {
         // Never bonded: the pairing was cancelled, timed out, or was refused —
-        // not a bond the peer removed. `connectionFailed` says "this attempt
-        // did not succeed, try again" without asserting a stale bond.
-        return connectionError(code: 10, status: status,
-                               message: message ?? "Pairing was not completed")
+        // not a bond the peer removed.
+        return NSError(domain: "CBATTErrorDomain", code: 5, userInfo: [
+            kGATTStatusKey: status,
+            NSLocalizedDescriptionKey: "Pairing was not completed",
+        ])
     }
     return connectionParityError(status: status, message: message)
 }
@@ -120,7 +123,7 @@ internal func connectionError(code: Int, status: Int, message: String) -> NSErro
 
 internal func connectionParityError(status: Int, message: String? = nil) -> NSError {
     var code = 10
-    if status == 5 || status == 6 || status == 61 || status == 137 {
+    if kAuthenticationStatuses.contains(status) {
         // The peer rejected or no longer holds our link key: HCI authentication
         // failure (5), PIN-or-key-missing (6), MIC failure (61), GATT_AUTH_FAIL
         // (137). CoreBluetooth reports the same dead end as
