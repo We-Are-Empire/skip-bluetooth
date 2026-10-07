@@ -19,8 +19,8 @@ let package = Package(
         .library(name: "SkipBluetooth", targets: ["SkipBluetooth"]),
     ],
     dependencies: [
-        .package(url: "https://source.skip.tools/skip.git", from: "1.2.32"),
-        .package(url: "https://source.skip.tools/skip-foundation.git", from: "1.2.18"),
+        .package(url: "https://github.com/skiptools/skip.git", from: "1.2.32"),
+        .package(url: "https://github.com/skiptools/skip-foundation.git", from: "1.2.18"),
     ],
     targets: [
         .target(
@@ -40,7 +40,7 @@ let package = Package(
 )
 
 if ProcessInfo.processInfo.environment["SKIP_BRIDGE"] ?? "0" != "0" {
-    package.dependencies += [.package(url: "https://source.skip.tools/skip-bridge.git", "0.0.0"..<"2.0.0")]
+    package.dependencies += [.package(url: "https://github.com/skiptools/skip-bridge.git", "0.0.0"..<"2.0.0")]
     package.targets.forEach({ target in
         target.dependencies += [.product(name: "SkipBridge", package: "skip-bridge")]
     })
