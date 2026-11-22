@@ -329,6 +329,12 @@ public class CBPeripheralManager: CBManager {
             guard execute else {
                 return
             }
+            // `BluetoothGattServer.sendResponse` takes a non-null device (annotated
+            // `@NonNull` from API 37); a request with no device has no one to answer.
+            guard let device = device else {
+                logger.warning("BleGattServerCallback.onExecuteWrite: Ignoring execute write request \(requestId) with no device")
+                return
+            }
 
             manager?.server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, nil)
         }
